@@ -1,0 +1,138 @@
+// =============================================================================
+// Infostealer Session Hijacking Hunting Queries for Microsoft Sentinel
+// Companion lab: nine-lives-security/nine-lives-zero-trust
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// HUNT 1: Users with Most Distinct IPs in Non-Interactive Sign-Ins
+// Purpose: Identify users whose background token refreshes span an abnormal
+//   number of distinct IP addresses. High IP diversity in non-interactive auth
+//   is a strong indicator of token distribution to multiple attacker nodes.
+// Lookback: 30 days
+// -----------------------------------------------------------------------------
+AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(30d)
+| where ResultType == "0"
+| summarize
+    DistinctIPs = dcount(IPAddress),
+    IPs = make_set(IPAddress, 25),
+    DistinctCountries = dcount(Location),
+    Countries = make_set(Location, 15),
+    DistinctApps = dcount(AppDisplayName),
+    EventCount = count()
+    by UserPrincipalName
+| where DistinctIPs > 10
+| sort by DistinctIPs desc
+
+// -----------------------------------------------------------------------------
+// HUNT 2: Token Refresh Patterns Outside Business Hours
+// Purpose: Surface users with significant non-interactive sign-in activity
+//   during off-hours (22:00–06:00 UTC). Automated token replay by infostealers
+//   often runs in different time zones than the victim, producing off-hours
+//   token refresh bursts.
+// Lookback: 7 days
+// -----------------------------------------------------------------------------
+AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(7d)
+| where ResultType == "0"
+| extend HourOfDay = hourofday(TimeGenerated)
+| where HourOfDay >= 22 or HourOfDay <= 6
+| summarize
+    OffHoursCount = count(),
+    DistinctIPs = dcount(IPAddress),
+    IPs = make_set(IPAddress, 10),
+    Apps = make_set(AppDisplayName, 10),
+    Countries = make_set(Location, 10)
+    by UserPrincipalName
+| where OffHoursCount > 20
+| sort by OffHoursCount desc
+
+// -----------------------------------------------------------------------------
+// HUNT 3: Sessions Spanning Multiple Countries in Single Day
+// Purpose: Find users with successful authentications from 3+ countries within
+//   a single day. Legitimate users rarely operate from more than 2 countries
+//   in a 24-hour window. Token distribution to geographically diverse attacker
+//   infrastructure creates multi-country footprints.
+// Lookback: 7 days
+// -----------------------------------------------------------------------------
+AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(7d)
+| where ResultType == "0"
+| extend Country = tostring(parse_json(tostring(LocationDetails)).countryOrRegion)
+| where isnotempty(Country)
+| summarize
+    DistinctCountries = dcount(Country),
+    Countries = make_set(Country, 20),
+    DistinctIPs = dcount(IPAddress),
+    IPs = make_set(IPAddress, 15),
+    EventCount = count()
+    by UserPrincipalName, bin(TimeGenerated, 1d)
+| where DistinctCountries >= 3
+| sort by DistinctCountries desc
+
+// -----------------------------------------------------------------------------
+// HUNT 4: High-Risk Sign-Ins Without MFA Challenge
+// Purpose: Identify sign-ins flagged as medium or high risk where MFA was not
+//   enforced. These represent sessions where stolen tokens bypassed MFA because
+//   the original authentication already satisfied the MFA requirement. The token
+//   carries the MFA claim even when replayed by an attacker.
+// Lookback: 14 days
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(14d)
+| where RiskLevelDuringSignIn in ("medium", "high")
+| where ResultType == "0"
+| where AuthenticationRequirement != "multiFactorAuthentication"
+    or isempty(AuthenticationRequirement)
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    IPAddress,
+    Location,
+    RiskLevelDuringSignIn,
+    RiskEventTypes_V2,
+    AppDisplayName,
+    AuthenticationRequirement,
+    ConditionalAccessStatus = tostring(ConditionalAccessStatus)
+
+// -----------------------------------------------------------------------------
+// HUNT 5: First-Time Device and First-Time Location Combination
+// Purpose: Find users where both the device ID and the city/country are new
+//   within the lookback period — a strong compound indicator. Either change
+//   alone may be benign (new laptop, travel), but both together in a
+//   non-interactive sign-in warrants investigation.
+// Lookback: 14 days (13-day baseline, 1-day detection window)
+// -----------------------------------------------------------------------------
+let LookbackPeriod = 14d;
+let BaselineEnd = 1d;
+let KnownDevices = AADNonInteractiveUserSignInLogs
+    | where TimeGenerated between (ago(LookbackPeriod) .. ago(BaselineEnd))
+    | where ResultType == "0"
+    | extend DeviceId = tostring(parse_json(DeviceDetail).deviceId)
+    | where isnotempty(DeviceId)
+    | summarize by UserPrincipalName, DeviceId;
+let KnownLocations = AADNonInteractiveUserSignInLogs
+    | where TimeGenerated between (ago(LookbackPeriod) .. ago(BaselineEnd))
+    | where ResultType == "0"
+    | extend City = tostring(parse_json(tostring(LocationDetails)).city)
+    | extend Country = tostring(parse_json(tostring(LocationDetails)).countryOrRegion)
+    | where isnotempty(City)
+    | summarize by UserPrincipalName, City, Country;
+AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(BaselineEnd)
+| where ResultType == "0"
+| extend DeviceId = tostring(parse_json(DeviceDetail).deviceId)
+| extend City = tostring(parse_json(tostring(LocationDetails)).city)
+| extend Country = tostring(parse_json(tostring(LocationDetails)).countryOrRegion)
+| where isnotempty(DeviceId) and isnotempty(City)
+| join kind=leftanti (KnownDevices) on UserPrincipalName, DeviceId
+| join kind=leftanti (KnownLocations) on UserPrincipalName, City, Country
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    DeviceId,
+    City,
+    Country,
+    IPAddress,
+    AppDisplayName
+| sort by TimeGenerated desc

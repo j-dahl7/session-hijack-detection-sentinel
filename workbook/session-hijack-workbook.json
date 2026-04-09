@@ -1,0 +1,127 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# Session Hijack Threat Dashboard\nMonitors infostealer session hijacking indicators across interactive and non-interactive sign-in logs.\n\n**Tables:** `SigninLogs`, `AADNonInteractiveUserSignInLogs` | **MITRE:** T1539 (Steal Web Session Cookie), T1550.001 (Application Access Token)"
+      },
+      "name": "header"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "timerange",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "label": "Time range",
+            "type": 4,
+            "isRequired": true,
+            "isGlobal": true,
+            "value": { "durationMs": 604800000 },
+            "timeContext": { "durationMs": 2592000000 },
+            "typeSettings": {
+              "allowCustom": true,
+              "selectableValues": [
+                { "durationMs": 86400000 },
+                { "durationMs": 604800000 },
+                { "durationMs": 2592000000 }
+              ]
+            }
+          }
+        ]
+      },
+      "name": "parameters"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "union SigninLogs, AADNonInteractiveUserSignInLogs\n| where TimeGenerated {TimeRange}\n| where ResultType == \"0\"\n| extend SignInType = iff(Type == \"SigninLogs\", \"Interactive\", \"Non-Interactive\")\n| summarize Events = count() by bin(TimeGenerated, 1h), SignInType\n| render timechart",
+        "size": 1,
+        "title": "Sign-in Volume Timeline (Interactive vs Non-Interactive)",
+        "queryType": 0,
+        "visualization": "timechart"
+      },
+      "name": "signin-timeline"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AADNonInteractiveUserSignInLogs\n| where TimeGenerated {TimeRange}\n| where ResultType == \"0\"\n| extend LocDetails = parse_json(tostring(LocationDetails))\n| extend Country = tostring(LocDetails.countryOrRegion)\n| extend City = tostring(LocDetails.city)\n| extend Lat = toreal(LocDetails.geoCoordinates.latitude)\n| extend Lon = toreal(LocDetails.geoCoordinates.longitude)\n| where isnotempty(Lat) and isnotempty(Lon)\n| summarize Events = count(), Users = dcount(UserPrincipalName) by City, Country, Lat, Lon\n| sort by Events desc\n| take 50",
+        "size": 1,
+        "title": "Non-Interactive Sign-in Geography",
+        "queryType": 0,
+        "visualization": "map",
+        "mapSettings": {
+          "locInfo": "LatLong",
+          "latitude": "Lat",
+          "longitude": "Lon",
+          "sizeSettings": "Events",
+          "labelSettings": "City",
+          "legendMetric": "Events",
+          "itemColorSettings": {
+            "nodeColorField": "Users",
+            "type": "heatmap",
+            "heatmapPalette": "greenRed"
+          }
+        }
+      },
+      "name": "geographic-map"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AADNonInteractiveUserSignInLogs\n| where TimeGenerated {TimeRange}\n| where ResultType == \"0\"\n| summarize\n    DistinctIPs = dcount(IPAddress),\n    DistinctCountries = dcount(Location),\n    TokenRefreshes = count(),\n    DistinctApps = dcount(AppDisplayName),\n    Apps = make_set(AppDisplayName, 10)\n    by UserPrincipalName\n| sort by DistinctIPs desc\n| take 20",
+        "size": 1,
+        "title": "Top Users by IP Diversity (Non-Interactive)",
+        "queryType": 0,
+        "visualization": "table"
+      },
+      "name": "top-users"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "union SigninLogs, AADNonInteractiveUserSignInLogs\n| where TimeGenerated {TimeRange}\n| where ResultType == \"0\"\n| extend SignInType = iff(Type == \"SigninLogs\", \"Interactive\", \"Non-Interactive\")\n| summarize Count = count() by SignInType\n| render piechart",
+        "size": 1,
+        "title": "Sign-in Type Breakdown",
+        "queryType": 0,
+        "visualization": "piechart"
+      },
+      "name": "type-breakdown"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "union SigninLogs, AADNonInteractiveUserSignInLogs\n| where TimeGenerated {TimeRange}\n| extend RiskLevel = coalesce(RiskLevelDuringSignIn, \"none\")\n| where RiskLevel != \"none\"\n| summarize Count = count() by RiskLevel\n| sort by Count desc\n| render barchart",
+        "size": 1,
+        "title": "Risk Level Distribution",
+        "queryType": 0,
+        "visualization": "barchart"
+      },
+      "name": "risk-distribution"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AADNonInteractiveUserSignInLogs\n| where TimeGenerated {TimeRange}\n| where ResultType == \"0\"\n| extend OS = tostring(parse_json(DeviceDetail).operatingSystem)\n| extend Browser = tostring(parse_json(DeviceDetail).browser)\n| where isnotempty(OS) and isnotempty(Browser)\n| extend Fingerprint = strcat(OS, \" | \", Browser)\n| summarize\n    DistinctFingerprints = dcount(Fingerprint),\n    Fingerprints = make_set(Fingerprint, 10),\n    DistinctIPs = dcount(IPAddress),\n    Events = count()\n    by UserPrincipalName\n| where DistinctFingerprints >= 3\n| sort by DistinctFingerprints desc",
+        "size": 1,
+        "title": "Device/Browser Anomaly Summary",
+        "queryType": 0,
+        "visualization": "table"
+      },
+      "name": "device-anomaly"
+    }
+  ],
+  "fallbackResourceIds": [ "placeholder" ],
+  "fromTemplateId": "sentinel-SessionHijackDashboard"
+}

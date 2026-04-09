@@ -1,0 +1,217 @@
+// =============================================================================
+// Infostealer Session Hijacking Detection Rules for Microsoft Sentinel
+// Companion lab: nine-lives-security/nine-lives-zero-trust
+// Tables: SigninLogs, AADNonInteractiveUserSignInLogs
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// RULE 1: Token Replay from New Device or IP
+// Severity: High
+// MITRE: T1539 (Steal Web Session Cookie), T1550.001 (Application Access Token)
+// Description: Detects non-interactive sign-ins (token refreshes) arriving from
+//   a device+IP combination never previously observed for that user within the
+//   past 14 days. Infostealers export browser cookies and replay them from
+//   attacker infrastructure — the token is valid but the source is unknown.
+// -----------------------------------------------------------------------------
+let LookbackPeriod = 14d;
+let DetectionWindow = 1d;
+let KnownUserFootprint = AADNonInteractiveUserSignInLogs
+    | where TimeGenerated between (ago(LookbackPeriod) .. ago(DetectionWindow))
+    | where ResultType == "0"
+    | summarize by UserPrincipalName, IPAddress, DeviceDetail_string = tostring(DeviceDetail);
+AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(DetectionWindow)
+| where ResultType == "0"
+| extend DeviceDetail_string = tostring(DeviceDetail)
+| extend DeviceId = tostring(parse_json(DeviceDetail).deviceId)
+| extend OS = tostring(parse_json(DeviceDetail).operatingSystem)
+| extend Browser = tostring(parse_json(DeviceDetail).browser)
+| join kind=leftanti (KnownUserFootprint)
+    on UserPrincipalName, IPAddress, DeviceDetail_string
+| where isnotempty(UserPrincipalName)
+| summarize
+    NewIPCount = dcount(IPAddress),
+    IPs = make_set(IPAddress, 10),
+    Apps = make_set(AppDisplayName, 10),
+    OS_Set = make_set(OS, 5),
+    Browser_Set = make_set(Browser, 5),
+    EventCount = count()
+    by UserPrincipalName, bin(TimeGenerated, 1h)
+| where NewIPCount >= 1
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    NewIPCount,
+    IPs,
+    Apps,
+    OS_Set,
+    Browser_Set,
+    EventCount
+
+// -----------------------------------------------------------------------------
+// RULE 2: Impossible Travel on Token Refresh
+// Severity: High
+// MITRE: T1539 (Steal Web Session Cookie)
+// Description: Detects consecutive non-interactive sign-ins for the same user
+//   where the geographic distance between locations exceeds what is physically
+//   possible given the elapsed time. Uses a 500 km/h threshold (generous for
+//   air travel). Infostealers typically operate from different geographic
+//   regions, and the non-interactive table captures background token refreshes
+//   that interactive-only rules miss.
+// -----------------------------------------------------------------------------
+let SpeedThresholdKmH = 500;
+let MinDistanceKm = 100;
+AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(1d)
+| where ResultType == "0"
+| extend LocDetails = parse_json(tostring(LocationDetails))
+| extend Lat = toreal(LocDetails.geoCoordinates.latitude)
+| extend Lon = toreal(LocDetails.geoCoordinates.longitude)
+| extend City = tostring(LocDetails.city)
+| extend Country = tostring(LocDetails.countryOrRegion)
+| where isnotempty(Lat) and isnotempty(Lon)
+| sort by UserPrincipalName asc, TimeGenerated asc
+| extend PrevLat = prev(Lat, 1), PrevLon = prev(Lon, 1),
+    PrevTime = prev(TimeGenerated, 1), PrevUser = prev(UserPrincipalName, 1),
+    PrevCity = prev(City, 1), PrevCountry = prev(Country, 1)
+| where UserPrincipalName == PrevUser
+| extend TimeDeltaHours = datetime_diff('second', TimeGenerated, PrevTime) / 3600.0
+| where TimeDeltaHours > 0
+| extend DistanceKm = geo_distance_2points(Lon, Lat, PrevLon, PrevLat) / 1000.0
+| extend SpeedKmH = DistanceKm / TimeDeltaHours
+| where SpeedKmH > SpeedThresholdKmH and DistanceKm > MinDistanceKm
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    FromCity = PrevCity,
+    FromCountry = PrevCountry,
+    ToCity = City,
+    ToCountry = Country,
+    DistanceKm = round(DistanceKm, 0),
+    TimeDeltaMinutes = round(TimeDeltaHours * 60, 1),
+    SpeedKmH = round(SpeedKmH, 0),
+    AppDisplayName,
+    IPAddress
+
+// -----------------------------------------------------------------------------
+// RULE 3: Anomalous Non-Interactive Sign-in Surge
+// Severity: Medium
+// MITRE: T1539 (Steal Web Session Cookie), T1550.001 (Application Access Token)
+// Description: Detects a spike in non-interactive sign-in volume for a user
+//   compared to their 7-day personal baseline. When an infostealer replays
+//   stolen cookies across multiple services (Outlook, Teams, SharePoint,
+//   OneDrive), it generates a burst of background token renewals that exceeds
+//   the user's normal rhythm.
+// -----------------------------------------------------------------------------
+let BaselinePeriod = 7d;
+let DetectionWindow = 1h;
+let SpikeMultiplier = 3;
+let MinAbsoluteThreshold = 20;
+let Baseline = AADNonInteractiveUserSignInLogs
+    | where TimeGenerated between (ago(BaselinePeriod) .. ago(DetectionWindow))
+    | where ResultType == "0"
+    | summarize BaselineHourlyAvg = count() / (24.0 * 7)
+        by UserPrincipalName;
+AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(DetectionWindow)
+| where ResultType == "0"
+| summarize
+    CurrentCount = count(),
+    DistinctApps = dcount(AppDisplayName),
+    Apps = make_set(AppDisplayName, 15),
+    DistinctIPs = dcount(IPAddress),
+    IPs = make_set(IPAddress, 10)
+    by UserPrincipalName
+| join kind=inner (Baseline) on UserPrincipalName
+| where CurrentCount > BaselineHourlyAvg * SpikeMultiplier
+    and CurrentCount > MinAbsoluteThreshold
+| extend SpikeRatio = round(CurrentCount / BaselineHourlyAvg, 1)
+| project
+    TimeGenerated = now(),
+    UserPrincipalName,
+    CurrentCount,
+    BaselineHourlyAvg = round(BaselineHourlyAvg, 1),
+    SpikeRatio,
+    DistinctApps,
+    Apps,
+    DistinctIPs,
+    IPs
+
+// -----------------------------------------------------------------------------
+// RULE 4: Browser or OS Mismatch in Same Session
+// Severity: Medium
+// MITRE: T1539 (Steal Web Session Cookie), T1550.001 (Application Access Token)
+// Description: Detects when the same user has non-interactive sign-ins with
+//   3+ different user agent fingerprints (browser + OS) within a 4-hour window.
+//   Most users have 1-2 device/browser combinations. When an infostealer
+//   replays tokens, the DeviceDetail often differs from the victim's original
+//   user agent, especially from headless browsers or Linux infrastructure.
+// -----------------------------------------------------------------------------
+let FingerprintThreshold = 3;
+let TimeWindowHours = 4h;
+AADNonInteractiveUserSignInLogs
+| where TimeGenerated > ago(1d)
+| where ResultType == "0"
+| extend OS = tostring(parse_json(DeviceDetail).operatingSystem)
+| extend Browser = tostring(parse_json(DeviceDetail).browser)
+| where isnotempty(OS) and isnotempty(Browser)
+| extend Fingerprint = strcat(OS, "|", Browser)
+| summarize
+    DistinctFingerprints = dcount(Fingerprint),
+    Fingerprints = make_set(Fingerprint, 10),
+    DistinctIPs = dcount(IPAddress),
+    IPs = make_set(IPAddress, 10),
+    Apps = make_set(AppDisplayName, 10),
+    EventCount = count()
+    by UserPrincipalName, bin(TimeGenerated, TimeWindowHours)
+| where DistinctFingerprints >= FingerprintThreshold
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    DistinctFingerprints,
+    Fingerprints,
+    DistinctIPs,
+    IPs,
+    Apps,
+    EventCount
+
+// -----------------------------------------------------------------------------
+// RULE 5: CAE Revocation Followed by New Location Auth
+// Severity: High
+// MITRE: T1539 (Steal Web Session Cookie), T1550.001 (Application Access Token)
+// Description: Detects when Continuous Access Evaluation (CAE) terminates a
+//   session but the user re-authenticates from a different IP within 30 minutes.
+//   CAE revokes tokens mid-session when risk is detected. If a new successful
+//   auth arrives from a different IP shortly after, the attacker likely has a
+//   separate stolen token or re-obtained access through replayed credentials.
+//   This is a strong signal of an active adversary fighting defensive controls.
+// -----------------------------------------------------------------------------
+let CAEWindow = 30m;
+let CAEEvents = SigninLogs
+    | where TimeGenerated > ago(1d)
+    | where ResultType != "0"
+    | where ResultType in ("50074", "530032", "530034", "50173", "70043")
+        or tostring(AuthenticationDetails) has "caePolicyId"
+        or tostring(ConditionalAccessPolicies) has "continuousAccessEvaluation"
+    | project CAETime = TimeGenerated, UserPrincipalName,
+        CAE_IP = IPAddress, CAE_Location = Location, ResultType;
+let NewAuth = union SigninLogs, AADNonInteractiveUserSignInLogs
+    | where TimeGenerated > ago(1d)
+    | where ResultType == "0"
+    | project AuthTime = TimeGenerated, UserPrincipalName,
+        Auth_IP = IPAddress, Auth_Location = Location,
+        AppDisplayName;
+CAEEvents
+| join kind=inner (NewAuth) on UserPrincipalName
+| where AuthTime between (CAETime .. (CAETime + CAEWindow))
+| where CAE_IP != Auth_IP
+| project
+    CAETime,
+    AuthTime,
+    UserPrincipalName,
+    CAE_IP,
+    CAE_Location,
+    Auth_IP,
+    Auth_Location,
+    AppDisplayName,
+    TimeDelta = AuthTime - CAETime
