@@ -161,12 +161,10 @@ if (-not $SkipDiagnostics) {
 
     if ($missingCategories.Count -gt 0) {
         Write-Host ""
-        Write-Host "  Missing diagnostic categories: $($missingCategories -join ', ')" -ForegroundColor Yellow
-        Write-Host "  Enable them in Entra admin center > Monitoring > Diagnostic settings," -ForegroundColor Yellow
-        Write-Host "  or run with -SkipDiagnostics to proceed without verification." -ForegroundColor Yellow
+        Write-Host "  WARNING: Missing diagnostic categories: $($missingCategories -join ', ')" -ForegroundColor Yellow
+        Write-Host "  Enable them in Entra admin center > Monitoring > Diagnostic settings." -ForegroundColor Yellow
+        Write-Host "  Continuing deployment — rules will deploy but may not fire until logs are flowing." -ForegroundColor Yellow
         Write-Host ""
-        $continue = Read-Host "  Continue anyway? (y/N)"
-        if ($continue -ne 'y') { return }
     }
 } else {
     Write-Host "`n[1/7] Skipping diagnostic settings check (-SkipDiagnostics)" -ForegroundColor DarkGray

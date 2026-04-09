@@ -48,9 +48,13 @@ Write-Host "  Calling Graph API /me with different User-Agent headers..."
 Write-Host "  This generates AADNonInteractiveUserSignInLogs entries with"
 Write-Host "  distinct browser/OS fingerprints -> triggers Rule 4.`n"
 
-$token = az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv 2>$null
+if ($TenantId) {
+    $token = az account get-access-token --resource https://graph.microsoft.com --tenant $TenantId --query accessToken -o tsv 2>$null
+} else {
+    $token = az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv 2>$null
+}
 if (-not $token) {
-    Write-Error "Failed to get Graph API token. Run 'az login' first."
+    Write-Error "Failed to get Graph API token. Run 'az login' first (add -TenantId if targeting a specific tenant)."
 }
 
 $userAgents = @(
