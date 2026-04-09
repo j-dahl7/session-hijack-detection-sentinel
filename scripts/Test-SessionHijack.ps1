@@ -61,12 +61,14 @@ $userAgents = @(
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/21A5248v"
 )
 
+# Keep the simulation on low-privilege endpoints so it works with the default
+# delegated Graph token that Azure CLI commonly receives (`User.Read`).
 $graphEndpoints = @(
     "https://graph.microsoft.com/v1.0/me",
-    "https://graph.microsoft.com/v1.0/me/messages?`$top=1",
-    "https://graph.microsoft.com/v1.0/me/drive/root",
-    "https://graph.microsoft.com/v1.0/me/calendar/events?`$top=1",
-    "https://graph.microsoft.com/v1.0/me/memberOf?`$top=1"
+    "https://graph.microsoft.com/v1.0/me?`$select=id",
+    "https://graph.microsoft.com/v1.0/me?`$select=displayName",
+    "https://graph.microsoft.com/v1.0/me?`$select=userPrincipalName",
+    "https://graph.microsoft.com/v1.0/me?`$select=id,displayName,userPrincipalName"
 )
 
 $headers = @{ Authorization = "Bearer $token" }

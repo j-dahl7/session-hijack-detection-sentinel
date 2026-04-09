@@ -38,6 +38,20 @@ cd session-hijack-detection-sentinel
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -Destroy
 ```
 
+## Expected Results
+
+- `LAB - Token Replay from New Device or IP` is usually the first rule to generate incidents in a small sandbox.
+- `LAB - Anomalous Non-Interactive Sign-in Surge` and `LAB - Browser or OS Mismatch in Same Session` often return live query matches from the same simulation run.
+- `LAB - Impossible Travel on Token Refresh` needs an extra sign-in from a different geography, such as Azure Cloud Shell or a VPN in another country.
+- `LAB - CAE Revocation Followed by New Location Auth` needs a real CAE revocation event, so it is valid but less common in test tenants.
+
+## Troubleshooting
+
+- The lab is portable across tenants, but it is not environment-agnostic. You still need Sentinel enabled, both Entra sign-in log categories routed to the workspace, Azure CLI authenticated, and PowerShell 7+.
+- The simulation now sticks to low-privilege Graph `User.Read` calls so it works with the default Azure CLI delegated token in most tenants.
+- If you still see sparse telemetry, wait 15-30 minutes for ingestion and 1 hour for scheduled analytics evaluation.
+- If the workbook's **Risk Level Distribution** panel is empty, that is expected until Entra ID emits medium or high risk signals.
+
 ## License
 
 MIT
