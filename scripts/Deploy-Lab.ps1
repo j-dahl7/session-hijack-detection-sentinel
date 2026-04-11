@@ -320,7 +320,7 @@ let CAEWindow = 30m;
 let CAEEvents = SigninLogs
     | where TimeGenerated > ago(1d)
     | where ResultType != "0"
-    | where ResultType in ("50074", "530032", "530034", "50173", "70043")
+    | where ResultType in ("50074", "530032", "530034", "50173", "70043", "50133", "50140", "50199")
         or tostring(AuthenticationDetails) has "caePolicyId"
         or tostring(ConditionalAccessPolicies) has "continuousAccessEvaluation"
     | project CAETime = TimeGenerated, UserPrincipalName, CAE_IP = IPAddress, CAE_Location = Location, ResultType;
