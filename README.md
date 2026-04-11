@@ -40,7 +40,7 @@ All 5 rules have been validated with real incidents in a live Sentinel workspace
 
 - **Rule 1 (Token Replay)** fires first. Any simulation run from a new IP or device triggers it within the first evaluation cycle.
 - **Rule 3 (Surge)** and **Rule 4 (Browser Mismatch)** fire after the simulation generates enough burst and multi-user-agent traffic. Running Test-SessionHijack.ps1 with -BurstCount 40 reliably triggers both.
-- **Rule 2 (Impossible Travel)** requires sign-ins from two different geographic locations. Connect to a VPN in a different city or country and run az rest --method GET --url "https://graph.microsoft.com/v1.0/me". In testing, Springfield to Toronto at 7,526 km/h triggered the rule immediately.
+- **Rule 2 (Impossible Travel)** requires sign-ins from two different geographic locations. Connect to a VPN in a different city or country and run az rest --method GET --url "https://graph.microsoft.com/v1.0/me". In testing, a US-to-Canada VPN hop at over 7,500 km/h triggered the rule immediately.
 - **Rule 5 (CAE Revocation)** requires a session revocation followed by re-authentication from a different IP. Revoke sessions with az rest --method POST --url "https://graph.microsoft.com/v1.0/users/{user-id}/revokeSignInSessions", then sign in from a VPN or different network.
 
 ## Troubleshooting
