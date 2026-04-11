@@ -40,8 +40,19 @@ All 5 rules have been validated with real incidents in a live Sentinel workspace
 
 - **Rule 1 (Token Replay)** fires first. Any simulation run from a new IP or device triggers it within the first evaluation cycle.
 - **Rule 3 (Surge)** and **Rule 4 (Browser Mismatch)** fire after the simulation generates enough burst and multi-user-agent traffic. Running Test-SessionHijack.ps1 with -BurstCount 40 reliably triggers both.
-- **Rule 2 (Impossible Travel)** requires sign-ins from two different geographic locations. Connect to a VPN in a different city or country and run az rest --method GET --url "https://graph.microsoft.com/v1.0/me". In testing, a US-to-Canada VPN hop at over 7,500 km/h triggered the rule immediately.
-- **Rule 5 (CAE Revocation)** requires a session revocation followed by re-authentication from a different IP. Revoke sessions with az rest --method POST --url "https://graph.microsoft.com/v1.0/users/{user-id}/revokeSignInSessions", then sign in from a VPN or different network.
+- **Rule 2 (Impossible Travel)** requires sign-ins from two different geographic locations. The most reliable method:
+  1. Run the simulation from your normal network
+  2. Connect to a VPN in a different city or country
+  3. From Windows PowerShell (not WSL — WSL may bypass the VPN), run: `az rest --method GET --url "https://graph.microsoft.com/v1.0/me"`
+  4. Wait for the rule to evaluate (up to 1 hour, or temporarily set queryFrequency to PT5M)
+  - In testing, a US-to-Canada VPN hop triggered the rule at over 7,500 km/h
+  - Azure Cloud Shell is another option but its IP may resolve to the same region depending on your tenant
+- **Rule 5 (CAE Revocation)** requires a session revocation followed by re-authentication from a different IP:
+  1. Revoke sessions: `az rest --method POST --url "https://graph.microsoft.com/v1.0/users/{user-id}/revokeSignInSessions"`
+  2. Re-authenticate with `az login`
+  3. Switch to a VPN in a different location and run a Graph API call
+  - The revocation produces CAE error codes (50133, 50140, 50199) and the re-auth from a new IP completes the correlation
+  - Note: after revoking sessions, your existing az CLI token will be invalidated by CAE — you must re-login before making further calls
 
 ## Troubleshooting
 
