@@ -4,9 +4,10 @@
     Simulates infostealer session hijacking telemetry for detection rule validation.
 
 .DESCRIPTION
-    Generates sign-in events that trigger the Session Hijacking Detection Lab rules.
-    Uses Graph API calls with varied parameters to create detectable patterns in
-    SigninLogs and AADNonInteractiveUserSignInLogs.
+    Performs benign Microsoft Graph calls with varied request headers and a
+    controlled request burst. This validates authentication and creates safe
+    seed activity, but downstream Graph requests do not map one-to-one to Entra
+    sign-in events and are not guaranteed to trigger the lab rules.
 
     IMPORTANT: This script does NOT perform actual session hijacking. It generates
     benign Graph API traffic that produces patterns matching the detection rules.
@@ -15,13 +16,13 @@
     Azure AD tenant ID.
 
 .PARAMETER BurstCount
-    Number of rapid Graph API calls for the surge simulation (default: 30).
+    Number of rapid Graph API calls for the connectivity burst (default: 30).
 
 .PARAMETER SkipBurst
     Skip the non-interactive sign-in surge simulation.
 
 .EXAMPLE
-    ./Test-SessionHijack.ps1 -TenantId "e24be7b2-dbc8-47ef-8071-593408b48c9e"
+    ./Test-SessionHijack.ps1 -TenantId "<tenant-id>"
 #>
 
 [CmdletBinding()]
@@ -39,14 +40,16 @@ param(
 $ErrorActionPreference = 'Stop'
 
 Write-Host "`n=== Session Hijacking Simulation ===" -ForegroundColor Cyan
-Write-Host "Generates benign Graph API traffic to trigger detection rules."
+Write-Host "Generates benign Graph API traffic for connectivity and seed activity."
 Write-Host "This does NOT perform actual session hijacking.`n"
+Write-Host "Graph resource calls do not guarantee one Entra sign-in row per request." -ForegroundColor Yellow
+Write-Host "Validate detections against actual token issuance/refresh telemetry.`n" -ForegroundColor Yellow
 
 # --- Scenario 1: Multi-User-Agent Graph API Calls ---
-Write-Host "[1/4] Scenario: Browser/OS Fingerprint Mismatch" -ForegroundColor Yellow
+Write-Host "[1/4] Scenario: Varied Graph Request Headers" -ForegroundColor Yellow
 Write-Host "  Calling Graph API /me with different User-Agent headers..."
-Write-Host "  This generates AADNonInteractiveUserSignInLogs entries with"
-Write-Host "  distinct browser/OS fingerprints -> triggers Rule 4.`n"
+Write-Host "  This validates request handling. These headers are not guaranteed"
+Write-Host "  to become Entra DeviceDetail fingerprints or trigger Rule 4.`n"
 
 if ($TenantId) {
     $token = az account get-access-token --resource https://graph.microsoft.com --tenant $TenantId --query accessToken -o tsv 2>$null
@@ -96,9 +99,10 @@ Write-Host "  Generated $successCount calls with $($userAgents.Count) distinct U
 
 # --- Scenario 2: Burst Non-Interactive Calls ---
 if (-not $SkipBurst) {
-    Write-Host "[2/4] Scenario: Non-Interactive Sign-in Surge" -ForegroundColor Yellow
-    Write-Host "  Sending $BurstCount rapid Graph API calls to create a volume spike"
-    Write-Host "  -> triggers Rule 3 (anomalous surge vs baseline).`n"
+    Write-Host "[2/4] Scenario: Graph Request Burst" -ForegroundColor Yellow
+    Write-Host "  Sending $BurstCount rapid Graph API calls to validate the request path."
+    Write-Host "  Cached-token requests may not create new Entra refresh events, so this"
+    Write-Host "  does not deterministically trigger Rule 3.`n"
 
     $burstSuccess = 0
     for ($i = 1; $i -le $BurstCount; $i++) {
@@ -164,10 +168,10 @@ Write-Host "  - Sign-in logs appear:    15-30 minutes"
 Write-Host "  - Analytics rules evaluate: ~1 hour (PT1H frequency)"
 Write-Host "  - Incidents created:       ~1.5 hours after simulation"
 Write-Host ""
-Write-Host "Rules expected to trigger:" -ForegroundColor Yellow
+Write-Host "Detection expectations (dependent on actual sign-in telemetry):" -ForegroundColor Yellow
 Write-Host "  Rule 1 (Token Replay):     If current IP is new for your account"
-Write-Host "  Rule 3 (Surge):            If burst exceeded 3x your hourly baseline"
-Write-Host "  Rule 4 (Fingerprint):      From multi-User-Agent calls"
+Write-Host "  Rule 3 (Surge):            Requires real token-refresh volume above baseline"
+Write-Host "  Rule 4 (Fingerprint):      Requires real DeviceDetail fingerprint diversity"
 Write-Host "  Rule 2 (Impossible Travel): Only with manual VPN/Cloud Shell step"
 Write-Host "  Rule 5 (CAE Revocation):    Requires actual CAE event (rare in labs)"
 Write-Host ""

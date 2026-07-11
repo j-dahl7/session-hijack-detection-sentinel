@@ -8,7 +8,7 @@
     1. Verifies Entra ID diagnostic settings (SigninLogs, NonInteractiveUserSignInLogs)
     2. Sentinel analytics rules (5 scheduled rules for session hijacking detection)
     3. Sentinel workbook (Session Hijack Threat Dashboard)
-    4. Runs the session hijacking simulation
+    4. Points to the optional session-hijacking telemetry helper
 
 .PARAMETER ResourceGroup
     Resource group containing the Sentinel workspace.
@@ -414,7 +414,9 @@ Write-Host "  $LabRoot/detection/hunting-queries.kql" -ForegroundColor DarkGray
 Write-Host "`n[5/7] Deploying Sentinel workbook..." -ForegroundColor Yellow
 
 $workbookContentPath = "$LabRoot/workbook/session-hijack-workbook.json"
-$workbookContent = Get-Content -Path $workbookContentPath -Raw
+$workbookDefinition = Get-Content -Path $workbookContentPath -Raw | ConvertFrom-Json
+$workbookDefinition.fallbackResourceIds = @($workspaceId)
+$workbookContent = $workbookDefinition | ConvertTo-Json -Depth 100 -Compress
 
 $workbookDisplayName = "Session Hijack Threat Dashboard"
 $existingWorkbook = @(
