@@ -6,7 +6,7 @@ Detect infostealer session hijacking with 5 Sentinel analytics rules, 5 hunting 
 
 ## Verification status
 
-**Source-verified with historical live evidence — last verified 2026-07-10.** PowerShell parsed, workbook JSON loaded, the five checked-in KQL rules matched the five deployment-script definitions, and tracked links and cleanup selectors were reviewed. No tenant changes, Graph calls, VPN tests, session revocations, or Sentinel queries were performed during this verification.
+**Source-verified with historical live evidence — last verified 2026-07-11.** PowerShell parsed, workbook JSON loaded, the five checked-in KQL rules matched the five deployment-script definitions, and tracked links and cleanup selectors were reviewed. A July 11 read-only tenant review and query were also performed; no analytics rules, incidents, workbooks, or other tenant resources were changed.
 
 The repository records prior live incidents for all five rules, but the helper script is not a deterministic incident generator: repeated Microsoft Graph resource requests made with one cached access token do not create one new Entra sign-in event per request, and request `User-Agent` headers are not guaranteed to become `DeviceDetail` fingerprints in Entra logs. Use the script as a safe connectivity and seed-activity helper, then validate against actual token issuance, refresh, VPN, and CAE telemetry. This repository does not currently include a standalone license file; confirm reuse terms before redistribution.
 
@@ -45,7 +45,7 @@ cd session-hijack-detection-sentinel
 
 All 5 rules were previously validated with real incidents in a live Sentinel workspace. Those observations are historical evidence, not a guarantee that one execution of `Test-SessionHijack.ps1` will reproduce them.
 
-- **Rule 1 (Token Replay)** fires first. Any simulation run from a new IP or device triggers it within the first evaluation cycle.
+- **Rule 1 (Token Replay)** now requires at least two successful refreshes in 65 minutes from both a new normalized device identity/fingerprint and a new IP relative to the prior 14 days. The deployed Sentinel query period should remain `P14D` so the scheduler makes that full baseline available to the hourly evaluation.
 - **Rule 3 (Surge)** and **Rule 4 (Browser Mismatch)** require actual non-interactive token activity in `AADNonInteractiveUserSignInLogs`. The helper's Graph request burst validates the low-privilege request path but cannot guarantee new token-refresh rows or distinct Entra device fingerprints.
 - **Rule 2 (Impossible Travel)** requires sign-ins from two different geographic locations. The most reliable method:
   1. Run the simulation from your normal network
@@ -76,6 +76,12 @@ The repository deploys rules and one workbook into an existing Sentinel workspac
 - **LocationDetails parsing:** Some workspaces store LocationDetails as a string. The KQL uses parse_json(tostring(LocationDetails)) to handle both formats.
 - **Burst produced no extra sign-in rows:** This can be expected. Entra records token issuance/refresh activity, not every downstream Graph resource request, and it aggregates similar non-interactive events.
 - **Browser mismatch did not fire:** A custom HTTP `User-Agent` on a Graph request is not guaranteed to populate Entra `DeviceDetail`. Validate the rule with real sign-ins or token refreshes from controlled client/device combinations.
+
+## Rule 1 noise hardening
+
+The original Rule 1 compared the exact raw `DeviceDetail` JSON plus IP address across a one-day detection window. A July 11, 2026 read-only review found 632 alerts and 48 still-new High incidents from that rule within the retained 30-day data, while the browser/OS rule had 285 alerts and 3 new incidents. This is useful historical validation, but that volume also showed that harmless IP churn and serialized device-field changes were being treated as High-severity novelty.
+
+The checked-in rule now prefers the stable Entra device ID and falls back to a normalized operating-system/browser key, baselines devices separately from IP addresses, requires both to be new, requires at least two events, and examines only the latest 65 minutes. The hardened source query returned zero candidates in the current 65-minute window during the read-only review. Deploying this version or closing existing incidents is deliberately left as an explicit tenant-owner action because either operation changes live Sentinel state.
 
 ## Cleanup scope
 

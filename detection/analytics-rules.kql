@@ -8,41 +8,60 @@
 // RULE 1: Token Replay from New Device or IP
 // Severity: High
 // MITRE: T1539 (Steal Web Session Cookie), T1550.001 (Application Access Token)
-// Description: Detects non-interactive sign-ins (token refreshes) arriving from
-//   a device+IP combination never previously observed for that user within the
-//   past 14 days. Infostealers export browser cookies and replay them from
-//   attacker infrastructure — the token is valid but the source is unknown.
+// Description: Detects at least two successful token refreshes from both a
+//   normalized device identity/fingerprint and an IP address that were not seen
+//   for the user in the prior 14-day baseline. The 65-minute detection window
+//   matches the hourly schedule without re-alerting over an entire day.
 // -----------------------------------------------------------------------------
 let LookbackPeriod = 14d;
-let DetectionWindow = 1d;
-let KnownUserFootprint = AADNonInteractiveUserSignInLogs
+let DetectionWindow = 65m;
+let MinEvents = 2;
+let KnownDevices = AADNonInteractiveUserSignInLogs
     | where TimeGenerated between (ago(LookbackPeriod) .. ago(DetectionWindow))
     | where ResultType == "0"
-    | summarize by UserPrincipalName, IPAddress, DeviceDetail_string = tostring(DeviceDetail);
+    | extend Device = parse_json(tostring(DeviceDetail))
+    | extend DeviceId = tolower(tostring(Device.deviceId)),
+             OS = tolower(tostring(Device.operatingSystem)),
+             Browser = tolower(tostring(Device.browser))
+    | extend DeviceKey = iff(isnotempty(DeviceId), strcat("id:", DeviceId),
+        iff(isnotempty(OS) and isnotempty(Browser), strcat("fp:", OS, "|", Browser), ""))
+    | where isnotempty(UserPrincipalName) and isnotempty(DeviceKey)
+    | summarize by UserPrincipalName, DeviceKey;
+let KnownIPs = AADNonInteractiveUserSignInLogs
+    | where TimeGenerated between (ago(LookbackPeriod) .. ago(DetectionWindow))
+    | where ResultType == "0"
+    | where isnotempty(UserPrincipalName) and isnotempty(IPAddress)
+    | summarize by UserPrincipalName, IPAddress;
 AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(DetectionWindow)
 | where ResultType == "0"
-| extend DeviceDetail_string = tostring(DeviceDetail)
-| extend DeviceId = tostring(parse_json(DeviceDetail).deviceId)
-| extend OS = tostring(parse_json(DeviceDetail).operatingSystem)
-| extend Browser = tostring(parse_json(DeviceDetail).browser)
-| join kind=leftanti (KnownUserFootprint)
-    on UserPrincipalName, IPAddress, DeviceDetail_string
-| where isnotempty(UserPrincipalName)
+| extend Device = parse_json(tostring(DeviceDetail))
+| extend DeviceId = tolower(tostring(Device.deviceId)),
+         OS = tolower(tostring(Device.operatingSystem)),
+         Browser = tolower(tostring(Device.browser))
+| extend DeviceKey = iff(isnotempty(DeviceId), strcat("id:", DeviceId),
+    iff(isnotempty(OS) and isnotempty(Browser), strcat("fp:", OS, "|", Browser), ""))
+| where isnotempty(UserPrincipalName) and isnotempty(IPAddress) and isnotempty(DeviceKey)
+| join kind=leftanti (KnownDevices) on UserPrincipalName, DeviceKey
+| join kind=leftanti (KnownIPs) on UserPrincipalName, IPAddress
 | summarize
     NewIPCount = dcount(IPAddress),
     IPs = make_set(IPAddress, 10),
+    DeviceKeys = make_set(DeviceKey, 10),
     Apps = make_set(AppDisplayName, 10),
     OS_Set = make_set(OS, 5),
     Browser_Set = make_set(Browser, 5),
     EventCount = count()
     by UserPrincipalName, bin(TimeGenerated, 1h)
-| where NewIPCount >= 1
+| where NewIPCount >= 1 and EventCount >= MinEvents
+| extend FirstIPAddress = tostring(IPs[0])
 | project
     TimeGenerated,
     UserPrincipalName,
+    FirstIPAddress,
     NewIPCount,
     IPs,
+    DeviceKeys,
     Apps,
     OS_Set,
     Browser_Set,

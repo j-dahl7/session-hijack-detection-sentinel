@@ -206,28 +206,40 @@ Write-Host "`n[3/7] Deploying Sentinel analytics rules..." -ForegroundColor Yell
 $rules = @(
     @{
         displayName = "LAB - Token Replay from New Device or IP"
-        description = "Detects non-interactive sign-ins from a device+IP combination never seen for the user in the past 14 days. Infostealers replay stolen cookies from unknown infrastructure."
+        description = "Detects repeated token refreshes from both a normalized device identity/fingerprint and an IP address not seen for the user in the prior 14-day baseline."
         severity    = "High"
         query       = @"
 let LookbackPeriod = 14d;
-let DetectionWindow = 1d;
-let KnownUserFootprint = AADNonInteractiveUserSignInLogs
+let DetectionWindow = 65m;
+let MinEvents = 2;
+let KnownDevices = AADNonInteractiveUserSignInLogs
     | where TimeGenerated between (ago(LookbackPeriod) .. ago(DetectionWindow))
     | where ResultType == "0"
-    | summarize by UserPrincipalName, IPAddress, DeviceDetail_string = tostring(DeviceDetail);
+    | extend Device = parse_json(tostring(DeviceDetail))
+    | extend DeviceId = tolower(tostring(Device.deviceId)), OS = tolower(tostring(Device.operatingSystem)), Browser = tolower(tostring(Device.browser))
+    | extend DeviceKey = iff(isnotempty(DeviceId), strcat("id:", DeviceId), iff(isnotempty(OS) and isnotempty(Browser), strcat("fp:", OS, "|", Browser), ""))
+    | where isnotempty(UserPrincipalName) and isnotempty(DeviceKey)
+    | summarize by UserPrincipalName, DeviceKey;
+let KnownIPs = AADNonInteractiveUserSignInLogs
+    | where TimeGenerated between (ago(LookbackPeriod) .. ago(DetectionWindow))
+    | where ResultType == "0"
+    | where isnotempty(UserPrincipalName) and isnotempty(IPAddress)
+    | summarize by UserPrincipalName, IPAddress;
 AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(DetectionWindow)
 | where ResultType == "0"
-| extend DeviceDetail_string = tostring(DeviceDetail)
-| extend OS = tostring(parse_json(DeviceDetail).operatingSystem)
-| extend Browser = tostring(parse_json(DeviceDetail).browser)
-| join kind=leftanti (KnownUserFootprint)
-    on UserPrincipalName, IPAddress, DeviceDetail_string
-| where isnotempty(UserPrincipalName)
-| summarize NewIPCount = dcount(IPAddress), IPs = make_set(IPAddress, 10), Apps = make_set(AppDisplayName, 10), OS_Set = make_set(OS, 5), Browser_Set = make_set(Browser, 5), EventCount = count() by UserPrincipalName, bin(TimeGenerated, 1h)
-| where NewIPCount >= 1
-| project TimeGenerated, UserPrincipalName, NewIPCount, IPs, Apps, OS_Set, Browser_Set, EventCount
+| extend Device = parse_json(tostring(DeviceDetail))
+| extend DeviceId = tolower(tostring(Device.deviceId)), OS = tolower(tostring(Device.operatingSystem)), Browser = tolower(tostring(Device.browser))
+| extend DeviceKey = iff(isnotempty(DeviceId), strcat("id:", DeviceId), iff(isnotempty(OS) and isnotempty(Browser), strcat("fp:", OS, "|", Browser), ""))
+| where isnotempty(UserPrincipalName) and isnotempty(IPAddress) and isnotempty(DeviceKey)
+| join kind=leftanti (KnownDevices) on UserPrincipalName, DeviceKey
+| join kind=leftanti (KnownIPs) on UserPrincipalName, IPAddress
+| summarize NewIPCount = dcount(IPAddress), IPs = make_set(IPAddress, 10), DeviceKeys = make_set(DeviceKey, 10), Apps = make_set(AppDisplayName, 10), OS_Set = make_set(OS, 5), Browser_Set = make_set(Browser, 5), EventCount = count() by UserPrincipalName, bin(TimeGenerated, 1h)
+| where NewIPCount >= 1 and EventCount >= MinEvents
+| extend FirstIPAddress = tostring(IPs[0])
+| project TimeGenerated, UserPrincipalName, FirstIPAddress, NewIPCount, IPs, DeviceKeys, Apps, OS_Set, Browser_Set, EventCount
 "@
+        queryPeriod    = "P14D"
         tactics        = @("CredentialAccess", "LateralMovement")
         techniques     = @("T1539", "T1550")
         subTechniques  = @("T1550.001")
