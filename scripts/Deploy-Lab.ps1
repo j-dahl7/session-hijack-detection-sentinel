@@ -8,7 +8,7 @@
     1. Verifies Entra ID diagnostic settings (SigninLogs, NonInteractiveUserSignInLogs)
     2. Sentinel analytics rules (5 scheduled rules for session hijacking detection)
     3. Sentinel workbook (Session Hijack Threat Dashboard)
-    4. Runs the session hijacking simulation
+    4. Points to the optional session-hijacking telemetry helper
 
 .PARAMETER ResourceGroup
     Resource group containing the Sentinel workspace.
@@ -51,8 +51,27 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LabRoot = Split-Path -Parent $ScriptDir
+$LabOwnerMarker = 'nine-lives-zero-trust:session-hijack-detection-sentinel'
+$LabRuleNames = @(
+    "LAB - Token Replay from New Device or IP",
+    "LAB - Impossible Travel on Token Refresh",
+    "LAB - Anomalous Non-Interactive Sign-in Surge",
+    "LAB - Browser or OS Mismatch in Same Session",
+    "LAB - CAE Revocation Followed by New Location Auth"
+)
+$LabWorkbookTitle = 'Session Hijack Threat Dashboard'
+
+function Get-LabResourceGuid {
+    param([Parameter(Mandatory)][string]$ResourceKey)
+
+    $hash = [System.Security.Cryptography.SHA256]::HashData(
+        [System.Text.Encoding]::UTF8.GetBytes("$workspaceId|$LabOwnerMarker|$ResourceKey")
+    )
+    return [guid]::new([byte[]]$hash[0..15]).ToString()
+}
 
 Write-Host "`n=== Infostealer Session Hijacking Detection Lab ===" -ForegroundColor Cyan
 Write-Host "Resource Group: $ResourceGroup"
@@ -91,21 +110,24 @@ if ($Destroy) {
         --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules?api-version=2024-03-01" `
         2>$null | ConvertFrom-Json
 
-    $labRuleNames = @(
-        "LAB - Token Replay from New Device or IP",
-        "LAB - Impossible Travel on Token Refresh",
-        "LAB - Anomalous Non-Interactive Sign-in Surge",
-        "LAB - Browser or OS Mismatch in Same Session",
-        "LAB - CAE Revocation Followed by New Location Auth"
-    )
-
-    foreach ($existingRule in @($existingRulesResponse.value)) {
-        if ($existingRule.properties.displayName -in $labRuleNames) {
-            Write-Host "  Deleting rule: $($existingRule.properties.displayName)"
-            az rest --method DELETE `
-                --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/$($existingRule.name)?api-version=2024-03-01" `
-                2>$null | Out-Null
-            Write-Host "    Deleted" -ForegroundColor Green
+    foreach ($labRuleName in $LabRuleNames) {
+        $expectedRuleId = Get-LabResourceGuid -ResourceKey "rule:$labRuleName"
+        $existingRule = @($existingRulesResponse.value) |
+            Where-Object { $_.name -eq $expectedRuleId } |
+            Select-Object -First 1
+        if ($existingRule) {
+            $ownedRule = $existingRule.properties.displayName -eq $labRuleName -and
+                $existingRule.properties.description -like "*$LabOwnerMarker*"
+            if (-not $ownedRule) {
+                throw "Refusing to delete analytics rule '$expectedRuleId': ownership marker or display name does not match this lab."
+            }
+            if ($PSCmdlet.ShouldProcess($labRuleName, 'Delete owned Sentinel analytics rule')) {
+                Write-Host "  Deleting rule: $labRuleName"
+                az rest --method DELETE `
+                    --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/${expectedRuleId}?api-version=2024-03-01" `
+                    2>$null | Out-Null
+                Write-Host "    Deleted" -ForegroundColor Green
+            }
         }
     }
 
@@ -113,18 +135,29 @@ if ($Destroy) {
         --resource-group $ResourceGroup `
         --resource-type Microsoft.Insights/workbooks `
         2>$null | ConvertFrom-Json
-    $labWorkbook = $existingWorkbooks | Where-Object {
-        $_.tags.'hidden-title' -eq "Session Hijack Threat Dashboard"
-    } | Select-Object -First 1
+    $expectedWorkbookId = Get-LabResourceGuid -ResourceKey 'workbook'
+    $labWorkbook = $existingWorkbooks | Where-Object { $_.name -eq $expectedWorkbookId } | Select-Object -First 1
     if ($labWorkbook) {
-        Write-Host "  Deleting workbook: Session Hijack Threat Dashboard"
-        az rest --method DELETE `
-            --url "$($labWorkbook.id)?api-version=2022-04-01" `
-            2>$null | Out-Null
-        Write-Host "    Deleted" -ForegroundColor Green
+        $ownedWorkbook = $labWorkbook.tags.'hidden-title' -eq $LabWorkbookTitle -and
+            $labWorkbook.tags.'nlzt-owner' -eq $LabOwnerMarker
+        if (-not $ownedWorkbook) {
+            throw "Refusing to delete workbook '$expectedWorkbookId': ownership tags do not match this lab."
+        }
+        if ($PSCmdlet.ShouldProcess($LabWorkbookTitle, 'Delete owned Sentinel workbook')) {
+            Write-Host "  Deleting workbook: $LabWorkbookTitle"
+            az rest --method DELETE `
+                --url "$($labWorkbook.id)?api-version=2022-04-01" `
+                2>$null | Out-Null
+            Write-Host "    Deleted" -ForegroundColor Green
+        }
     }
 
-    Write-Host "`nLab resources destroyed." -ForegroundColor Green
+    if ($WhatIfPreference) {
+        Write-Host "`nCleanup preview complete; no resources were deleted." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "`nLab resources destroyed." -ForegroundColor Green
+    }
     return
 }
 
@@ -211,22 +244,26 @@ $rules = @(
         query       = @"
 let LookbackPeriod = 14d;
 let DetectionWindow = 1d;
+let MinUnfamiliarEvents = 1;
 let KnownUserFootprint = AADNonInteractiveUserSignInLogs
     | where TimeGenerated between (ago(LookbackPeriod) .. ago(DetectionWindow))
     | where ResultType == "0"
-    | summarize by UserPrincipalName, IPAddress, DeviceDetail_string = tostring(DeviceDetail);
+    | extend DeviceId = tostring(parse_json(DeviceDetail).deviceId)
+    | summarize by UserPrincipalName, IPAddress, DeviceId
+    | extend Known = true;
 AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(DetectionWindow)
 | where ResultType == "0"
-| extend DeviceDetail_string = tostring(DeviceDetail)
+| where isnotempty(UserPrincipalName)
+| extend DeviceId = tostring(parse_json(DeviceDetail).deviceId)
 | extend OS = tostring(parse_json(DeviceDetail).operatingSystem)
 | extend Browser = tostring(parse_json(DeviceDetail).browser)
-| join kind=leftanti (KnownUserFootprint)
-    on UserPrincipalName, IPAddress, DeviceDetail_string
-| where isnotempty(UserPrincipalName)
-| summarize NewIPCount = dcount(IPAddress), IPs = make_set(IPAddress, 10), Apps = make_set(AppDisplayName, 10), OS_Set = make_set(OS, 5), Browser_Set = make_set(Browser, 5), EventCount = count() by UserPrincipalName, bin(TimeGenerated, 1h)
-| where NewIPCount >= 1
-| project TimeGenerated, UserPrincipalName, NewIPCount, IPs, Apps, OS_Set, Browser_Set, EventCount
+| join kind=leftouter (KnownUserFootprint)
+    on UserPrincipalName, IPAddress, DeviceId
+| extend IsUnfamiliar = isnull(Known)
+| summarize UnfamiliarEvents = countif(IsUnfamiliar), NewIPCount = dcountif(IPAddress, IsUnfamiliar), IPs = make_set_if(IPAddress, IsUnfamiliar, 10), Apps = make_set_if(AppDisplayName, IsUnfamiliar, 10), OS_Set = make_set_if(OS, IsUnfamiliar, 5), Browser_Set = make_set_if(Browser, IsUnfamiliar, 5), EventCount = count() by UserPrincipalName, bin(TimeGenerated, 1h)
+| where UnfamiliarEvents >= MinUnfamiliarEvents
+| project TimeGenerated, UserPrincipalName, UnfamiliarEvents, NewIPCount, IPs, Apps, OS_Set, Browser_Set, EventCount
 "@
         tactics        = @("CredentialAccess", "LateralMovement")
         techniques     = @("T1539", "T1550")
@@ -247,7 +284,7 @@ AADNonInteractiveUserSignInLogs
 | extend Lon = toreal(LocDetails.geoCoordinates.longitude)
 | extend City = tostring(LocDetails.city)
 | extend Country = tostring(LocDetails.countryOrRegion)
-| where isnotempty(Lat) and isnotempty(Lon)
+| where isnotnull(Lat) and isnotnull(Lon)
 | sort by UserPrincipalName asc, TimeGenerated asc
 | extend PrevLat = prev(Lat, 1), PrevLon = prev(Lon, 1), PrevTime = prev(TimeGenerated, 1), PrevUser = prev(UserPrincipalName, 1), PrevCity = prev(City, 1), PrevCountry = prev(Country, 1)
 | where UserPrincipalName == PrevUser
@@ -317,11 +354,12 @@ AADNonInteractiveUserSignInLogs
         severity    = "High"
         query       = @"
 let CAEWindow = 30m;
+let RevocationCodes = dynamic(["530032", "530034", "50173", "70043", "50133"]);
 let CAEEvents = SigninLogs
     | where TimeGenerated > ago(1d)
     | where ResultType != "0"
-    | where ResultType in ("50074", "530032", "530034", "50173", "70043", "50133", "50140", "50199")
-        or tostring(AuthenticationDetails) has "caePolicyId"
+    | where ResultType in (RevocationCodes)
+    | where tostring(AuthenticationDetails) has "caePolicyId"
         or tostring(ConditionalAccessPolicies) has "continuousAccessEvaluation"
     | project CAETime = TimeGenerated, UserPrincipalName, CAE_IP = IPAddress, CAE_Location = Location, ResultType;
 let NewAuth = union SigninLogs, AADNonInteractiveUserSignInLogs
@@ -343,22 +381,26 @@ CAEEvents
 $existingRulesResponse = az rest --method GET `
     --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules?api-version=2024-03-01" `
     2>$null | ConvertFrom-Json
-$existingRuleIdsByName = @{}
-foreach ($existingRule in @($existingRulesResponse.value)) {
-    $existingDisplayName = $existingRule.properties.displayName
-    if ($existingDisplayName) {
-        $existingRuleIdsByName[$existingDisplayName] = $existingRule.name
-    }
-}
-
 foreach ($rule in $rules) {
     Write-Host "  Deploying: $($rule.displayName)"
+
+    $ruleId = Get-LabResourceGuid -ResourceKey "rule:$($rule.displayName)"
+    $existingById = @($existingRulesResponse.value) | Where-Object { $_.name -eq $ruleId } | Select-Object -First 1
+    $foreignSameName = @($existingRulesResponse.value) | Where-Object {
+        $_.properties.displayName -eq $rule.displayName -and $_.name -ne $ruleId
+    } | Select-Object -First 1
+    if ($foreignSameName) {
+        throw "A non-lab analytics rule already uses '$($rule.displayName)' (ID $($foreignSameName.name)); refusing to overwrite or shadow it."
+    }
+    if ($existingById -and $existingById.properties.description -notlike "*$LabOwnerMarker*") {
+        throw "Analytics rule ID '$ruleId' exists without this lab's ownership marker; refusing to overwrite it."
+    }
 
     $ruleBody = @{
         kind       = "Scheduled"
         properties = @{
             displayName           = $rule.displayName
-            description           = $rule.description
+            description           = "$($rule.description) [Owner: $LabOwnerMarker]"
             severity              = $rule.severity
             query                 = $rule.query
             queryFrequency        = "PT1H"
@@ -383,26 +425,24 @@ foreach ($rule in $rules) {
         }
     } | ConvertTo-Json -Depth 10
 
-    $bodyFile = New-TemporaryFile
-    [System.IO.File]::WriteAllText($bodyFile.FullName, $ruleBody, [System.Text.Encoding]::UTF8)
+    $ruleAction = if ($existingById) { "Updated" } else { "Created" }
+    if ($PSCmdlet.ShouldProcess($rule.displayName, "$ruleAction Sentinel analytics rule")) {
+        $bodyFile = New-TemporaryFile
+        try {
+            [System.IO.File]::WriteAllText($bodyFile.FullName, $ruleBody, [System.Text.Encoding]::UTF8)
+            $result = az rest --method PUT `
+                --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/${ruleId}?api-version=2024-03-01" `
+                --body "@$($bodyFile.FullName)" `
+                --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
 
-    $ruleId = if ($existingRuleIdsByName[$rule.displayName]) {
-        $existingRuleIdsByName[$rule.displayName]
-    } else {
-        [guid]::NewGuid().ToString()
-    }
-    $ruleAction = if ($existingRuleIdsByName[$rule.displayName]) { "Updated" } else { "Created" }
-    $result = az rest --method PUT `
-        --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/${ruleId}?api-version=2024-03-01" `
-        --body "@$($bodyFile.FullName)" `
-        --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
-
-    Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue
-
-    if ($result.name) {
-        Write-Host "    ${ruleAction}: $($result.name)" -ForegroundColor Green
-    } else {
-        Write-Host "    Warning: Rule may not have deployed correctly" -ForegroundColor Red
+            if (-not $result.name) {
+                throw "Sentinel did not return an analytics rule resource"
+            }
+            Write-Host "    ${ruleAction}: $($result.name)" -ForegroundColor Green
+        }
+        finally {
+            Remove-Item $bodyFile.FullName -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -414,24 +454,35 @@ Write-Host "  $LabRoot/detection/hunting-queries.kql" -ForegroundColor DarkGray
 Write-Host "`n[5/7] Deploying Sentinel workbook..." -ForegroundColor Yellow
 
 $workbookContentPath = "$LabRoot/workbook/session-hijack-workbook.json"
-$workbookContent = Get-Content -Path $workbookContentPath -Raw
+$workbookDefinition = Get-Content -Path $workbookContentPath -Raw | ConvertFrom-Json
+$workbookDefinition.fallbackResourceIds = @($workspaceId)
+$workbookContent = $workbookDefinition | ConvertTo-Json -Depth 100 -Compress
 
-$workbookDisplayName = "Session Hijack Threat Dashboard"
-$existingWorkbook = @(
+$workbookDisplayName = $LabWorkbookTitle
+$workbookId = Get-LabResourceGuid -ResourceKey 'workbook'
+$allWorkbooks = @(
     az resource list `
         --resource-group $ResourceGroup `
         --resource-type Microsoft.Insights/workbooks `
         2>$null | ConvertFrom-Json
-) | Where-Object {
-    $_.tags.'hidden-title' -eq $workbookDisplayName
+)
+$existingWorkbook = $allWorkbooks | Where-Object { $_.name -eq $workbookId } | Select-Object -First 1
+$foreignSameTitleWorkbook = $allWorkbooks | Where-Object {
+    $_.tags.'hidden-title' -eq $workbookDisplayName -and $_.name -ne $workbookId
 } | Select-Object -First 1
-$workbookId = if ($existingWorkbook) { $existingWorkbook.name } else { [guid]::NewGuid().ToString() }
+if ($foreignSameTitleWorkbook) {
+    throw "A non-lab workbook already uses '$workbookDisplayName' (ID $($foreignSameTitleWorkbook.name)); refusing to overwrite or shadow it."
+}
+if ($existingWorkbook -and $existingWorkbook.tags.'nlzt-owner' -ne $LabOwnerMarker) {
+    throw "Workbook ID '$workbookId' exists without this lab's ownership tag; refusing to overwrite it."
+}
 $workbookAction = if ($existingWorkbook) { "Updated" } else { "Created" }
 $workbookBody = @{
     location   = $workspace.location
     kind       = "shared"
     tags       = @{
         'hidden-title' = $workbookDisplayName
+        'nlzt-owner'   = $LabOwnerMarker
     }
     properties = @{
         displayName    = $workbookDisplayName
@@ -441,20 +492,23 @@ $workbookBody = @{
     }
 } | ConvertTo-Json -Depth 10
 
-$bodyFile = New-TemporaryFile
-[System.IO.File]::WriteAllText($bodyFile.FullName, $workbookBody, [System.Text.Encoding]::UTF8)
+if ($PSCmdlet.ShouldProcess($workbookDisplayName, "$workbookAction Sentinel workbook")) {
+    $bodyFile = New-TemporaryFile
+    try {
+        [System.IO.File]::WriteAllText($bodyFile.FullName, $workbookBody, [System.Text.Encoding]::UTF8)
+        $wbResult = az rest --method PUT `
+            --url "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Insights/workbooks/${workbookId}?api-version=2022-04-01" `
+            --body "@$($bodyFile.FullName)" `
+            --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
 
-$wbResult = az rest --method PUT `
-    --url "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Insights/workbooks/${workbookId}?api-version=2022-04-01" `
-    --body "@$($bodyFile.FullName)" `
-    --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
-
-Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue
-
-if ($wbResult.name) {
-    Write-Host "  Workbook $($workbookAction.ToLower()): $($wbResult.properties.displayName)" -ForegroundColor Green
-} else {
-    Write-Host "  Warning: Workbook may not have deployed correctly" -ForegroundColor Red
+        if (-not $wbResult.name) {
+            throw "Azure did not return a workbook resource"
+        }
+        Write-Host "  Workbook $($workbookAction.ToLower()): $($wbResult.properties.displayName)" -ForegroundColor Green
+    }
+    finally {
+        Remove-Item $bodyFile.FullName -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # --- [6/7] Simulation ---
@@ -463,9 +517,10 @@ Write-Host "  Run Test-SessionHijack.ps1 to generate detectable telemetry:" -For
 Write-Host "  $ScriptDir/Test-SessionHijack.ps1" -ForegroundColor DarkGray
 
 # --- [7/7] Summary ---
-Write-Host "`n[7/7] Deployment complete!" -ForegroundColor Green
+$completionLabel = if ($WhatIfPreference) { 'Deployment preview complete; no changes applied.' } else { 'Deployment complete!' }
+Write-Host "`n[7/7] $completionLabel" -ForegroundColor Green
 Write-Host ""
-Write-Host "=== Deployed Resources ===" -ForegroundColor Cyan
+Write-Host "=== $(if ($WhatIfPreference) { 'Planned Resources' } else { 'Deployed Resources' }) ===" -ForegroundColor Cyan
 Write-Host "  Analytics Rules: 5 scheduled rules"
 Write-Host "    - LAB - Token Replay from New Device or IP (High)"
 Write-Host "    - LAB - Impossible Travel on Token Refresh (High)"

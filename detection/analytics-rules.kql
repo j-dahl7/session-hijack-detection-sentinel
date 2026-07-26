@@ -12,35 +12,48 @@
 //   a device+IP combination never previously observed for that user within the
 //   past 14 days. Infostealers export browser cookies and replay them from
 //   attacker infrastructure — the token is valid but the source is unknown.
+//   The footprint key is the user, the IP and the device id, not the whole
+//   DeviceDetail bag, because that bag carries the browser version string and
+//   every Chrome update would otherwise make every user look new. Familiar
+//   refreshes are kept and flagged instead of being joined away, so the hourly
+//   bucket covers everything the user did and UnfamiliarEvents can genuinely be
+//   zero. MinUnfamiliarEvents is therefore a real bound rather than a count
+//   that is true by construction: at 1 a single unfamiliar refresh still raises
+//   an incident, and raising it trades that sensitivity for volume.
 // -----------------------------------------------------------------------------
 let LookbackPeriod = 14d;
 let DetectionWindow = 1d;
+let MinUnfamiliarEvents = 1;
 let KnownUserFootprint = AADNonInteractiveUserSignInLogs
     | where TimeGenerated between (ago(LookbackPeriod) .. ago(DetectionWindow))
     | where ResultType == "0"
-    | summarize by UserPrincipalName, IPAddress, DeviceDetail_string = tostring(DeviceDetail);
+    | extend DeviceId = tostring(parse_json(DeviceDetail).deviceId)
+    | summarize by UserPrincipalName, IPAddress, DeviceId
+    | extend Known = true;
 AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(DetectionWindow)
 | where ResultType == "0"
-| extend DeviceDetail_string = tostring(DeviceDetail)
+| where isnotempty(UserPrincipalName)
 | extend DeviceId = tostring(parse_json(DeviceDetail).deviceId)
 | extend OS = tostring(parse_json(DeviceDetail).operatingSystem)
 | extend Browser = tostring(parse_json(DeviceDetail).browser)
-| join kind=leftanti (KnownUserFootprint)
-    on UserPrincipalName, IPAddress, DeviceDetail_string
-| where isnotempty(UserPrincipalName)
+| join kind=leftouter (KnownUserFootprint)
+    on UserPrincipalName, IPAddress, DeviceId
+| extend IsUnfamiliar = isnull(Known)
 | summarize
-    NewIPCount = dcount(IPAddress),
-    IPs = make_set(IPAddress, 10),
-    Apps = make_set(AppDisplayName, 10),
-    OS_Set = make_set(OS, 5),
-    Browser_Set = make_set(Browser, 5),
+    UnfamiliarEvents = countif(IsUnfamiliar),
+    NewIPCount = dcountif(IPAddress, IsUnfamiliar),
+    IPs = make_set_if(IPAddress, IsUnfamiliar, 10),
+    Apps = make_set_if(AppDisplayName, IsUnfamiliar, 10),
+    OS_Set = make_set_if(OS, IsUnfamiliar, 5),
+    Browser_Set = make_set_if(Browser, IsUnfamiliar, 5),
     EventCount = count()
     by UserPrincipalName, bin(TimeGenerated, 1h)
-| where NewIPCount >= 1
+| where UnfamiliarEvents >= MinUnfamiliarEvents
 | project
     TimeGenerated,
     UserPrincipalName,
+    UnfamiliarEvents,
     NewIPCount,
     IPs,
     Apps,
@@ -69,7 +82,7 @@ AADNonInteractiveUserSignInLogs
 | extend Lon = toreal(LocDetails.geoCoordinates.longitude)
 | extend City = tostring(LocDetails.city)
 | extend Country = tostring(LocDetails.countryOrRegion)
-| where isnotempty(Lat) and isnotempty(Lon)
+| where isnotnull(Lat) and isnotnull(Lon)
 | sort by UserPrincipalName asc, TimeGenerated asc
 | extend PrevLat = prev(Lat, 1), PrevLon = prev(Lon, 1),
     PrevTime = prev(TimeGenerated, 1), PrevUser = prev(UserPrincipalName, 1),
@@ -185,13 +198,24 @@ AADNonInteractiveUserSignInLogs
 //   auth arrives from a different IP shortly after, the attacker likely has a
 //   separate stolen token or re-obtained access through replayed credentials.
 //   This is a strong signal of an active adversary fighting defensive controls.
+//   The two halves stay correlated on the user and the 30 minute window. A token
+//   replayed from separate attacker infrastructure opens its own sign-in chain,
+//   so correlating on CorrelationId would exclude the very scenario above; the
+//   different source IP is what carries the signal. What the revocation half now
+//   requires is real CAE evidence: a session revocation result code AND a CAE
+//   marker in AuthenticationDetails or in the evaluated Conditional Access
+//   policies. Previously either half sufficed, so a rule about CAE could fire
+//   with no CAE involved. 50074 (strong authentication required) is an MFA
+//   challenge rather than a revocation and is no longer a trigger, and neither
+//   are 50140 (keep me signed in) or 50199 (Microsoft interrupt page).
 // -----------------------------------------------------------------------------
 let CAEWindow = 30m;
+let RevocationCodes = dynamic(["530032", "530034", "50173", "70043", "50133"]);
 let CAEEvents = SigninLogs
     | where TimeGenerated > ago(1d)
     | where ResultType != "0"
-    | where ResultType in ("50074", "530032", "530034", "50173", "70043", "50133", "50140", "50199")
-        or tostring(AuthenticationDetails) has "caePolicyId"
+    | where ResultType in (RevocationCodes)
+    | where tostring(AuthenticationDetails) has "caePolicyId"
         or tostring(ConditionalAccessPolicies) has "continuousAccessEvaluation"
     | project CAETime = TimeGenerated, UserPrincipalName,
         CAE_IP = IPAddress, CAE_Location = Location, ResultType;
