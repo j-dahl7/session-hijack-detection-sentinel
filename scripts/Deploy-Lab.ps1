@@ -265,6 +265,11 @@ AADNonInteractiveUserSignInLogs
 | where UnfamiliarEvents >= MinUnfamiliarEvents
 | project TimeGenerated, UserPrincipalName, UnfamiliarEvents, NewIPCount, IPs, Apps, OS_Set, Browser_Set, EventCount
 "@
+        # LookbackPeriod is 14d, so the rule must be able to see 14 days. Under the
+        # default P1D the KnownUserFootprint subquery resolves to an empty set, the
+        # leftouter join leaves Known null on every row, and IsUnfamiliar becomes
+        # true for every sign-in - the rule alerts on all normal traffic.
+        queryPeriod    = "P14D"
         tactics        = @("CredentialAccess", "LateralMovement")
         techniques     = @("T1539", "T1550")
         subTechniques  = @("T1550.001")
