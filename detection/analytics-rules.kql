@@ -154,9 +154,11 @@ AADNonInteractiveUserSignInLogs
 // RULE 4: Browser or OS Mismatch in Same Session
 // Severity: Medium
 // MITRE: T1539 (Steal Web Session Cookie), T1550.001 (Application Access Token)
-// Description: Detects when the same user has non-interactive sign-ins with
-//   3+ different user agent fingerprints (browser + OS) within a 4-hour window.
-//   Most users have 1-2 device/browser combinations. When an infostealer
+// Description: Detects when the same recorded Entra session has non-interactive
+//   sign-ins with 3+ different user agent fingerprints (browser + OS) within
+//   the same fixed 4-hour bucket. Rows without a SessionId are excluded rather
+//   than being treated as evidence about one session. Most sessions have 1-2
+//   device/browser combinations. When an infostealer
 //   replays tokens, the DeviceDetail often differs from the victim's original
 //   user agent, especially from headless browsers or Linux infrastructure.
 // -----------------------------------------------------------------------------
@@ -165,6 +167,7 @@ let TimeWindowHours = 4h;
 AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(1d)
 | where ResultType == "0"
+| where isnotempty(UserPrincipalName) and isnotempty(SessionId)
 | extend OS = tostring(parse_json(DeviceDetail).operatingSystem)
 | extend Browser = tostring(parse_json(DeviceDetail).browser)
 | where isnotempty(OS) and isnotempty(Browser)
@@ -176,11 +179,12 @@ AADNonInteractiveUserSignInLogs
     IPs = make_set(IPAddress, 10),
     Apps = make_set(AppDisplayName, 10),
     EventCount = count()
-    by UserPrincipalName, bin(TimeGenerated, TimeWindowHours)
+    by UserPrincipalName, SessionId, bin(TimeGenerated, TimeWindowHours)
 | where DistinctFingerprints >= FingerprintThreshold
 | project
     TimeGenerated,
     UserPrincipalName,
+    SessionId,
     DistinctFingerprints,
     Fingerprints,
     DistinctIPs,

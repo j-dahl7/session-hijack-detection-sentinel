@@ -37,6 +37,20 @@ class SessionHijackScriptContractTests(unittest.TestCase):
         self.assertIn("A non-lab workbook already uses", self.deploy_source)
         self.assertNotIn("$existingRuleIdsByName", self.deploy_source)
 
+    def test_browser_os_rule_is_correlated_to_one_recorded_session(self):
+        self.assertIn(
+            "where isnotempty(UserPrincipalName) and isnotempty(SessionId)",
+            self.deploy_source,
+        )
+        self.assertIn(
+            "by UserPrincipalName, SessionId, bin(TimeGenerated, TimeWindowHours)",
+            self.deploy_source,
+        )
+        self.assertIn(
+            "project TimeGenerated, UserPrincipalName, SessionId, DistinctFingerprints",
+            self.deploy_source,
+        )
+
     @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is not available")
     def test_deploy_and_destroy_whatif_perform_no_mutations_or_temp_writes(self):
         harness = textwrap.dedent(
