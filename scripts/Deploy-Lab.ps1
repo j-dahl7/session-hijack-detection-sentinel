@@ -333,7 +333,7 @@ AADNonInteractiveUserSignInLogs
     },
     @{
         displayName = "LAB - Browser or OS Mismatch in Same Session"
-        description = "Detects 3+ distinct browser/OS fingerprints for the same user in a 4-hour window. Infostealers replaying tokens often have different DeviceDetail than the victim's original user agent."
+        description = "Detects 3+ distinct browser/OS fingerprints for the same recorded Entra session in a fixed 4-hour bucket. Rows without SessionId are excluded."
         severity    = "Medium"
         query       = @"
 let FingerprintThreshold = 3;
@@ -341,13 +341,14 @@ let TimeWindowHours = 4h;
 AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(1d)
 | where ResultType == "0"
+| where isnotempty(UserPrincipalName) and isnotempty(SessionId)
 | extend OS = tostring(parse_json(DeviceDetail).operatingSystem)
 | extend Browser = tostring(parse_json(DeviceDetail).browser)
 | where isnotempty(OS) and isnotempty(Browser)
 | extend Fingerprint = strcat(OS, "|", Browser)
-| summarize DistinctFingerprints = dcount(Fingerprint), Fingerprints = make_set(Fingerprint, 10), DistinctIPs = dcount(IPAddress), IPs = make_set(IPAddress, 10), Apps = make_set(AppDisplayName, 10), EventCount = count() by UserPrincipalName, bin(TimeGenerated, TimeWindowHours)
+| summarize DistinctFingerprints = dcount(Fingerprint), Fingerprints = make_set(Fingerprint, 10), DistinctIPs = dcount(IPAddress), IPs = make_set(IPAddress, 10), Apps = make_set(AppDisplayName, 10), EventCount = count() by UserPrincipalName, SessionId, bin(TimeGenerated, TimeWindowHours)
 | where DistinctFingerprints >= FingerprintThreshold
-| project TimeGenerated, UserPrincipalName, DistinctFingerprints, Fingerprints, DistinctIPs, IPs, Apps, EventCount
+| project TimeGenerated, UserPrincipalName, SessionId, DistinctFingerprints, Fingerprints, DistinctIPs, IPs, Apps, EventCount
 "@
         tactics        = @("DefenseEvasion", "CredentialAccess")
         techniques     = @("T1539", "T1550")
