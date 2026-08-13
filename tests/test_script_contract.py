@@ -51,6 +51,16 @@ class SessionHijackScriptContractTests(unittest.TestCase):
             self.deploy_source,
         )
 
+    def test_rule_descriptions_preserve_tuple_and_travel_boundaries(self):
+        readme = (LAB_ROOT / "README.md").read_text(encoding="utf-8")
+        queries = (LAB_ROOT / "detection" / "analytics-rules.kql").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("new combination does not prove either value is globally new", readme)
+        self.assertIn("Legitimate flights, VPN egress, and GeoIP error", self.deploy_source)
+        self.assertIn("legitimate air travel, VPN egress changes, or GeoIP error", queries)
+
     @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is not available")
     def test_deploy_and_destroy_whatif_perform_no_mutations_or_temp_writes(self):
         harness = textwrap.dedent(
