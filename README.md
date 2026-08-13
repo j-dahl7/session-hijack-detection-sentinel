@@ -6,12 +6,12 @@ Detect infostealer session hijacking with 5 Sentinel analytics rules, 5 hunting 
 
 ## Validation Boundary
 
-The hardened July 25, 2026 revision passed offline PowerShell parsing, mocked
+The August 13, 2026 source-audited revision passed offline PowerShell parsing, mocked
 ownership/cleanup checks, and KQL/static contract review. It was not freshly
 deployed, queried, or exercised against a live Entra/Sentinel tenant. Historical
 incidents may demonstrate earlier revisions, but they do not prove that the
 current helper will create the token issuance, refresh, device, geography, risk,
-or CAE rows required by every rule.
+or revoked-grant rows required by every rule.
 
 ## What Gets Deployed
 
@@ -21,7 +21,7 @@ or CAE rows required by every rule.
 | LAB - Impossible Travel on Token Refresh | Analytics Rule (High) | 500 km/h triage threshold; legitimate flights, VPN egress, and GeoIP error require context and tenant tuning. T1539 |
 | LAB - Anomalous Non-Interactive Sign-in Surge | Analytics Rule (Medium) | T1539, T1550.001 |
 | LAB - Browser or OS Mismatch in Same Session | Analytics Rule (Medium) | T1539, T1550.001 |
-| LAB - CAE Revocation Followed by New Location Auth | Analytics Rule (High) | T1539, T1550.001 |
+| LAB - Revoked Grant Followed by New-IP Authentication | Analytics Rule (High) | Entra error 50173 followed by a same-UserId success from a different IP; triage lead, not proof of theft or CAE enforcement. T1539, T1550.001 |
 | Session Hijack Threat Dashboard | Workbook | - |
 
 ## Prerequisites
@@ -76,12 +76,38 @@ rule.
 | Impossible Travel | Successful sign-ins/token refreshes from geographically separated public IPs with usable locations and timestamps; a VPN or Cloud Shell may still resolve nearby or be normalized |
 | Non-Interactive Surge | Enough qualifying rows in `AADNonInteractiveUserSignInLogs` above the rule threshold/baseline, not merely repeated cached-token API calls |
 | Browser/OS Mismatch | The same recorded session with genuinely different browser/OS fingerprints in `DeviceDetail` |
-| CAE Revocation | A real CAE/revocation failure followed by qualifying authentication from a new location; the helper does not perform or prove this lifecycle |
+| Revoked Grant | Error 50173 in either interactive or non-interactive logs, followed within 30 minutes by a successful authentication in either table for the same nonempty immutable `UserId` from a different `IPAddress`; the helper does not perform this lifecycle |
 
 Validate in layers: confirm raw rows and their session/correlation fields,
 execute each KQL query manually over the right time window, then wait for the
 scheduled rule and incident pipeline. Treat rule silence as a data/condition
 question, not proof that the deployment or attack simulation succeeded.
+
+### Rule 5 manual validation
+
+Use a dedicated low-privilege lab identity because revoking sign-in sessions
+invalidates that user's refresh tokens across applications:
+
+1. At egress IP A, sign in to an application that uses refresh tokens. Confirm
+   the raw row and record its nonempty `UserId`.
+2. As an authorized administrator, revoke the lab user's sign-in sessions.
+3. Let the existing client at IP A attempt a token refresh. Confirm a
+   `SigninLogs` or `AADNonInteractiveUserSignInLogs` row whose `ResultType` is
+   `50173`.
+4. Only after that failure, reauthenticate the same user from approved egress
+   IP B within 30 minutes. Confirm a success (`ResultType == "0"`) with the same
+   `UserId` and a different `IPAddress`.
+5. Run Rule 5 manually over the matching time range before waiting for its
+   hourly schedule.
+
+Microsoft documents 50173 as an expired grant that was revoked; causes include
+password changes, refresh-token expiry, and administrator revocation. It does
+not by itself prove Continuous Access Evaluation or malicious activity. Both
+interactive and non-interactive sign-in tabs can contain relevant requests, so
+the rule searches both tables on each side of the correlation. Review
+[Microsoft's 50173 guidance](https://learn.microsoft.com/en-us/troubleshoot/entra/entra-id/app-integration/error-code-aadsts50173-grant-expired-revoked),
+[the sign-in table schema](https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/aadnoninteractiveusersigninlogs),
+and [CAE reporting boundaries](https://learn.microsoft.com/en-us/entra/identity/conditional-access/howto-continuous-access-evaluation-troubleshoot).
 
 The helper sends benign calls to Microsoft Graph and queries `api.ipify.org` to
 display the current public IP. Run it only with a dedicated low-privilege lab
