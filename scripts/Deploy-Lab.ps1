@@ -276,7 +276,7 @@ AADNonInteractiveUserSignInLogs
     },
     @{
         displayName = "LAB - Impossible Travel on Token Refresh"
-        description = "Detects consecutive non-interactive sign-ins where geographic distance exceeds physical possibility (>500 km/h). Infostealers operate from different regions than the victim."
+        description = "Detects consecutive non-interactive sign-ins exceeding 500 km/h. Legitimate flights, VPN egress, and GeoIP error require analyst context and tenant tuning."
         severity    = "High"
         query       = @"
 let SpeedThresholdKmH = 500;

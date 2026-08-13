@@ -17,8 +17,8 @@ or CAE rows required by every rule.
 
 | Resource | Type | MITRE |
 |---|---|---|
-| LAB - Token Replay from New Device or IP | Analytics Rule (High) | T1539, T1550.001 |
-| LAB - Impossible Travel on Token Refresh | Analytics Rule (High) | T1539 |
+| LAB - Token Replay from New Device or IP | Analytics Rule (High) | Unfamiliar user/IP/device-ID tuple; a new combination does not prove either value is globally new. T1539, T1550.001 |
+| LAB - Impossible Travel on Token Refresh | Analytics Rule (High) | 500 km/h triage threshold; legitimate flights, VPN egress, and GeoIP error require context and tenant tuning. T1539 |
 | LAB - Anomalous Non-Interactive Sign-in Surge | Analytics Rule (Medium) | T1539, T1550.001 |
 | LAB - Browser or OS Mismatch in Same Session | Analytics Rule (Medium) | T1539, T1550.001 |
 | LAB - CAE Revocation Followed by New Location Auth | Analytics Rule (High) | T1539, T1550.001 |

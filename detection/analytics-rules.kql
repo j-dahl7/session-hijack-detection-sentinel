@@ -67,8 +67,9 @@ AADNonInteractiveUserSignInLogs
 // MITRE: T1539 (Steal Web Session Cookie)
 // Description: Detects consecutive non-interactive sign-ins for the same user
 //   where the geographic distance between locations exceeds what is physically
-//   possible given the elapsed time. Uses a 500 km/h threshold (generous for
-//   air travel). Infostealers typically operate from different geographic
+//   possible given the elapsed time. The 500 km/h threshold can also match
+//   legitimate air travel, VPN egress changes, or GeoIP error; tune and
+//   correlate it with travel context. Infostealers often operate from different geographic
 //   regions, and the non-interactive table captures background token refreshes
 //   that interactive-only rules miss.
 // -----------------------------------------------------------------------------
