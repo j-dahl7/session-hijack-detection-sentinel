@@ -46,7 +46,7 @@ Write-Host "Graph resource calls do not guarantee one Entra sign-in row per requ
 Write-Host "Validate detections against actual token issuance/refresh telemetry.`n" -ForegroundColor Yellow
 
 # --- Scenario 1: Multi-User-Agent Graph API Calls ---
-Write-Host "[1/4] Scenario: Varied Graph Request Headers" -ForegroundColor Yellow
+Write-Host "[1/5] Scenario: Varied Graph Request Headers" -ForegroundColor Yellow
 Write-Host "  Calling Graph API /me with different User-Agent headers..."
 Write-Host "  This validates request handling. These headers are not guaranteed"
 Write-Host "  to become Entra DeviceDetail fingerprints or trigger Rule 4.`n"
@@ -99,7 +99,7 @@ Write-Host "  Generated $successCount calls with $($userAgents.Count) distinct U
 
 # --- Scenario 2: Burst Non-Interactive Calls ---
 if (-not $SkipBurst) {
-    Write-Host "[2/4] Scenario: Graph Request Burst" -ForegroundColor Yellow
+    Write-Host "[2/5] Scenario: Graph Request Burst" -ForegroundColor Yellow
     Write-Host "  Sending $BurstCount rapid Graph API calls to validate the request path."
     Write-Host "  Cached-token requests may not create new Entra refresh events, so this"
     Write-Host "  does not deterministically trigger Rule 3.`n"
@@ -123,11 +123,11 @@ if (-not $SkipBurst) {
     }
     Write-Host "  Generated $burstSuccess/$BurstCount burst calls`n"
 } else {
-    Write-Host "[2/4] Skipping burst simulation (-SkipBurst)`n" -ForegroundColor DarkGray
+    Write-Host "[2/5] Skipping burst simulation (-SkipBurst)`n" -ForegroundColor DarkGray
 }
 
 # --- Scenario 3: New IP Token Use ---
-Write-Host "[3/4] Scenario: Token Use from Current IP" -ForegroundColor Yellow
+Write-Host "[3/5] Scenario: Token Use from Current IP" -ForegroundColor Yellow
 Write-Host "  Actual token issuance or refresh may record your current source IP."
 Write-Host "  A genuinely new IP can then contribute evidence for Rule 1.`n"
 
@@ -146,7 +146,7 @@ if ($meInfo) {
 Write-Host ""
 
 # --- Scenario 4: Impossible Travel (Manual) ---
-Write-Host "[4/4] Scenario: Impossible Travel (Manual Steps Required)" -ForegroundColor Yellow
+Write-Host "[4/5] Scenario: Impossible Travel (Manual Steps Required)" -ForegroundColor Yellow
 Write-Host "  This scenario cannot be automated from a single machine."
 Write-Host "  To trigger Rule 2 (Impossible Travel on Token Refresh):`n"
 Write-Host "  Option A: VPN-based" -ForegroundColor White
@@ -160,18 +160,33 @@ Write-Host "    2. Open Azure Cloud Shell (portal.azure.com)"
 Write-Host "    3. Run: az rest --method GET --url https://graph.microsoft.com/v1.0/me"
 Write-Host "    4. Cloud Shell runs from Azure datacenter IP -> different geo`n"
 
+# --- Scenario 5: Revoked Grant Followed by New-IP Authentication (Manual) ---
+Write-Host "[5/5] Scenario: Revoked Grant Followed by New-IP Authentication (Manual)" -ForegroundColor Yellow
+Write-Host "  This helper intentionally does not revoke a user's sessions. To validate Rule 5:`n"
+Write-Host "    1. Use a dedicated, low-privilege lab user and two approved egress paths."
+Write-Host "    2. At IP A, sign in to an app that uses refresh tokens; confirm the raw"
+Write-Host "       sign-in row and record its immutable UserId."
+Write-Host "    3. As an authorized administrator, revoke that lab user's sign-in sessions."
+Write-Host "       This invalidates the user's refresh tokens across applications."
+Write-Host "    4. Let the existing client at IP A attempt a token refresh. Confirm a raw"
+Write-Host "       SigninLogs or AADNonInteractiveUserSignInLogs row with ResultType 50173."
+Write-Host "    5. Only after that failure, reauthenticate the same lab user at IP B within"
+Write-Host "       30 minutes. Confirm ResultType 0, the same nonempty UserId, and a"
+Write-Host "       different IPAddress, then run Rule 5 manually over the matching window.`n"
+Write-Host "  A password change or refresh-token expiry can also produce 50173. A rule"
+Write-Host "  match is therefore a triage lead, not proof of theft or CAE enforcement.`n" -ForegroundColor Yellow
+
 # --- Summary ---
 Write-Host "=== Simulation Complete ===" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Expected detection timeline:" -ForegroundColor Yellow
-Write-Host "  - Sign-in logs appear:    15-30 minutes"
-Write-Host "  - Analytics rules evaluate: ~1 hour (PT1H frequency)"
-Write-Host "  - Incidents created:       ~1.5 hours after simulation"
+Write-Host "Validation timing:" -ForegroundColor Yellow
+Write-Host "  Sign-in ingestion, hourly rule evaluation, and incident creation are"
+Write-Host "  asynchronous. Confirm raw rows first; do not assume a fixed arrival time."
 Write-Host ""
 Write-Host "Detection expectations (dependent on actual sign-in telemetry):" -ForegroundColor Yellow
 Write-Host "  Rule 1 (Token Replay):     If current IP is new for your account"
 Write-Host "  Rule 3 (Surge):            Requires real token-refresh volume above baseline"
 Write-Host "  Rule 4 (Fingerprint):      Requires real DeviceDetail fingerprint diversity"
 Write-Host "  Rule 2 (Impossible Travel): Only with manual VPN/Cloud Shell step"
-Write-Host "  Rule 5 (CAE Revocation):    Requires actual CAE event (rare in labs)"
+Write-Host "  Rule 5 (Revoked Grant):    Requires 50173 then same-UserId success from another IP"
 Write-Host ""

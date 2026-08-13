@@ -1,14 +1,18 @@
 import shutil
 import subprocess
 import os
+import json
 import textwrap
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
 LAB_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_SCRIPT = LAB_ROOT / "scripts" / "Deploy-Lab.ps1"
 TEST_SCRIPT = LAB_ROOT / "scripts" / "Test-SessionHijack.ps1"
+ANALYTICS_RULES = LAB_ROOT / "detection" / "analytics-rules.kql"
+RULE5_FIXTURES = LAB_ROOT / "tests" / "fixtures" / "rule5-revoked-grant.json"
 
 
 class SessionHijackScriptContractTests(unittest.TestCase):
@@ -60,6 +64,73 @@ class SessionHijackScriptContractTests(unittest.TestCase):
         self.assertIn("new combination does not prove either value is globally new", readme)
         self.assertIn("Legitimate flights, VPN egress, and GeoIP error", self.deploy_source)
         self.assertIn("legitimate air travel, VPN egress changes, or GeoIP error", queries)
+
+    def test_rule_five_uses_documented_revoked_grant_semantics(self):
+        queries = ANALYTICS_RULES.read_text(encoding="utf-8")
+        for source in (queries, self.deploy_source):
+            with self.subTest(source="standalone" if source is queries else "deployment"):
+                self.assertIn("Revoked Grant Followed by New-IP Authentication", source)
+                self.assertEqual(source.count('tostring(ResultType) == "50173"'), 1)
+                self.assertIn(
+                    "union withsource=RevocationTable isfuzzy=true SigninLogs, AADNonInteractiveUserSignInLogs",
+                    source,
+                )
+                self.assertIn(
+                    "union withsource=AuthTable isfuzzy=true SigninLogs, AADNonInteractiveUserSignInLogs",
+                    source,
+                )
+                self.assertIn("join kind=inner (SuccessfulAuth) on UserId", source)
+                self.assertIn("isnotempty(UserId) and isnotempty(IPAddress)", source)
+                self.assertIn("AuthTime > RevocationTime", source)
+                self.assertIn("AuthTime <= RevocationTime + CorrelationWindow", source)
+                self.assertIn("RevokedIP != AuthIP", source)
+                self.assertNotIn("caePolicyId", source)
+                self.assertNotIn("RevocationCodes", source)
+
+    def test_rule_five_positive_and_negative_fixtures(self):
+        fixture = json.loads(RULE5_FIXTURES.read_text(encoding="utf-8"))
+        window = timedelta(minutes=fixture["correlation_window_minutes"])
+
+        def timestamp(record):
+            return datetime.fromisoformat(record["time"].replace("Z", "+00:00"))
+
+        def matches(records):
+            revoked = [
+                record
+                for record in records
+                if record["result_type"] == "50173"
+                and record["user_id"]
+                and record["ip"]
+            ]
+            successful = [
+                record
+                for record in records
+                if record["result_type"] == "0"
+                and record["user_id"]
+                and record["ip"]
+            ]
+            return any(
+                revoked_record["user_id"] == auth_record["user_id"]
+                and timestamp(auth_record) > timestamp(revoked_record)
+                and timestamp(auth_record) <= timestamp(revoked_record) + window
+                and revoked_record["ip"] != auth_record["ip"]
+                for revoked_record in revoked
+                for auth_record in successful
+            )
+
+        for case in fixture["cases"]:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(matches(case["records"]), case["expect_match"])
+
+    def test_rule_five_manual_validation_is_ordered_and_truthful(self):
+        readme = (LAB_ROOT / "README.md").read_text(encoding="utf-8")
+        for source in (readme, self.test_source):
+            self.assertIn("50173", source)
+            self.assertIn("not proof of theft or CAE enforcement", source)
+        self.assertIn("same nonempty immutable `UserId`", readme)
+        self.assertIn("same nonempty UserId", self.test_source)
+        self.assertIn("Only after that failure", self.test_source)
+        self.assertNotIn("Requires actual CAE event", self.test_source)
 
     @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is not available")
     def test_deploy_and_destroy_whatif_perform_no_mutations_or_temp_writes(self):

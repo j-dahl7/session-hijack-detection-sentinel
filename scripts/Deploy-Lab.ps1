@@ -60,7 +60,7 @@ $LabRuleNames = @(
     "LAB - Impossible Travel on Token Refresh",
     "LAB - Anomalous Non-Interactive Sign-in Surge",
     "LAB - Browser or OS Mismatch in Same Session",
-    "LAB - CAE Revocation Followed by New Location Auth"
+    "LAB - Revoked Grant Followed by New-IP Authentication"
 )
 $LabWorkbookTitle = 'Session Hijack Threat Dashboard'
 
@@ -355,28 +355,26 @@ AADNonInteractiveUserSignInLogs
         subTechniques  = @("T1550.001")
     },
     @{
-        displayName = "LAB - CAE Revocation Followed by New Location Auth"
-        description = "Detects when CAE terminates a session but the user re-authenticates from a different IP within 30 minutes. Indicates an active adversary fighting defensive token revocation."
+        displayName = "LAB - Revoked Grant Followed by New-IP Authentication"
+        description = "Detects Microsoft Entra error 50173 followed by successful authentication for the same immutable user ID from a different IP within 30 minutes. This is a triage lead, not proof of token theft or CAE enforcement."
         severity    = "High"
         query       = @"
-let CAEWindow = 30m;
-let RevocationCodes = dynamic(["530032", "530034", "50173", "70043", "50133"]);
-let CAEEvents = SigninLogs
+let CorrelationWindow = 30m;
+let RevokedGrants = union withsource=RevocationTable isfuzzy=true SigninLogs, AADNonInteractiveUserSignInLogs
     | where TimeGenerated > ago(1d)
-    | where ResultType != "0"
-    | where ResultType in (RevocationCodes)
-    | where tostring(AuthenticationDetails) has "caePolicyId"
-        or tostring(ConditionalAccessPolicies) has "continuousAccessEvaluation"
-    | project CAETime = TimeGenerated, UserPrincipalName, CAE_IP = IPAddress, CAE_Location = Location, ResultType;
-let NewAuth = union SigninLogs, AADNonInteractiveUserSignInLogs
+    | where tostring(ResultType) == "50173"
+    | where isnotempty(UserId) and isnotempty(IPAddress)
+    | project RevocationTime = TimeGenerated, UserId, RevokedUPN = UserPrincipalName, RevokedIP = IPAddress, RevocationTable;
+let SuccessfulAuth = union withsource=AuthTable isfuzzy=true SigninLogs, AADNonInteractiveUserSignInLogs
     | where TimeGenerated > ago(1d)
-    | where ResultType == "0"
-    | project AuthTime = TimeGenerated, UserPrincipalName, Auth_IP = IPAddress, Auth_Location = Location, AppDisplayName;
-CAEEvents
-| join kind=inner (NewAuth) on UserPrincipalName
-| where AuthTime between (CAETime .. (CAETime + CAEWindow))
-| where CAE_IP != Auth_IP
-| project CAETime, AuthTime, UserPrincipalName, CAE_IP, CAE_Location, Auth_IP, Auth_Location, AppDisplayName, TimeDelta = AuthTime - CAETime
+    | where tostring(ResultType) == "0"
+    | where isnotempty(UserId) and isnotempty(IPAddress)
+    | project AuthTime = TimeGenerated, UserId, AuthUPN = UserPrincipalName, AuthIP = IPAddress, AppDisplayName, AuthTable;
+RevokedGrants
+| join kind=inner (SuccessfulAuth) on UserId
+| where AuthTime > RevocationTime and AuthTime <= RevocationTime + CorrelationWindow
+| where RevokedIP != AuthIP
+| project TimeGenerated = RevocationTime, RevocationTime, AuthTime, UserId, UserPrincipalName = coalesce(AuthUPN, RevokedUPN), RevokedIP, AuthIP, AppDisplayName, RevocationTable, AuthTable, TimeDelta = AuthTime - RevocationTime
 "@
         tactics        = @("CredentialAccess", "Persistence", "LateralMovement")
         techniques     = @("T1539", "T1550")
@@ -532,7 +530,7 @@ Write-Host "    - LAB - Token Replay from New Device or IP (High)"
 Write-Host "    - LAB - Impossible Travel on Token Refresh (High)"
 Write-Host "    - LAB - Anomalous Non-Interactive Sign-in Surge (Medium)"
 Write-Host "    - LAB - Browser or OS Mismatch in Same Session (Medium)"
-Write-Host "    - LAB - CAE Revocation Followed by New Location Auth (High)"
+Write-Host "    - LAB - Revoked Grant Followed by New-IP Authentication (High)"
 Write-Host "  Workbook:        Session Hijack Threat Dashboard"
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Yellow

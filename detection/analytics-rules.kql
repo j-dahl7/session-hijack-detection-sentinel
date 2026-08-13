@@ -194,53 +194,57 @@ AADNonInteractiveUserSignInLogs
     EventCount
 
 // -----------------------------------------------------------------------------
-// RULE 5: CAE Revocation Followed by New Location Auth
+// RULE 5: Revoked Grant Followed by New-IP Authentication
 // Severity: High
 // MITRE: T1539 (Steal Web Session Cookie), T1550.001 (Application Access Token)
-// Description: Detects when Continuous Access Evaluation (CAE) terminates a
-//   session but the user re-authenticates from a different IP within 30 minutes.
-//   CAE revokes tokens mid-session when risk is detected. If a new successful
-//   auth arrives from a different IP shortly after, the attacker likely has a
-//   separate stolen token or re-obtained access through replayed credentials.
-//   This is a strong signal of an active adversary fighting defensive controls.
-//   The two halves stay correlated on the user and the 30 minute window. A token
-//   replayed from separate attacker infrastructure opens its own sign-in chain,
-//   so correlating on CorrelationId would exclude the very scenario above; the
-//   different source IP is what carries the signal. What the revocation half now
-//   requires is real CAE evidence: a session revocation result code AND a CAE
-//   marker in AuthenticationDetails or in the evaluated Conditional Access
-//   policies. Previously either half sufficed, so a rule about CAE could fire
-//   with no CAE involved. 50074 (strong authentication required) is an MFA
-//   challenge rather than a revocation and is no longer a trigger, and neither
-//   are 50140 (keep me signed in) or 50199 (Microsoft interrupt page).
+// Description: Detects a Microsoft Entra 50173 failure (the presented grant
+//   expired because it was revoked) followed by a successful authentication for
+//   the same immutable, nonempty UserId from a different IP within 30 minutes.
+//   Both interactive and non-interactive sign-in tables are searched on both
+//   sides of the correlation because either side can contain the relevant row.
+//   A match is a triage lead, not proof of token theft or CAE enforcement:
+//   password changes, refresh-token expiry, administrator revocation, VPN
+//   changes, mobile egress, and shared proxies can all create benign matches.
+//   Error 50173 has documented revoked-grant semantics; the rule intentionally
+//   avoids inferring causality from undocumented serialized fields or treating
+//   other interruption and Conditional Access result codes as revocations.
 // -----------------------------------------------------------------------------
-let CAEWindow = 30m;
-let RevocationCodes = dynamic(["530032", "530034", "50173", "70043", "50133"]);
-let CAEEvents = SigninLogs
+let CorrelationWindow = 30m;
+let RevokedGrants = union withsource=RevocationTable isfuzzy=true SigninLogs, AADNonInteractiveUserSignInLogs
     | where TimeGenerated > ago(1d)
-    | where ResultType != "0"
-    | where ResultType in (RevocationCodes)
-    | where tostring(AuthenticationDetails) has "caePolicyId"
-        or tostring(ConditionalAccessPolicies) has "continuousAccessEvaluation"
-    | project CAETime = TimeGenerated, UserPrincipalName,
-        CAE_IP = IPAddress, CAE_Location = Location, ResultType;
-let NewAuth = union SigninLogs, AADNonInteractiveUserSignInLogs
+    | where tostring(ResultType) == "50173"
+    | where isnotempty(UserId) and isnotempty(IPAddress)
+    | project
+        RevocationTime = TimeGenerated,
+        UserId,
+        RevokedUPN = UserPrincipalName,
+        RevokedIP = IPAddress,
+        RevocationTable;
+let SuccessfulAuth = union withsource=AuthTable isfuzzy=true SigninLogs, AADNonInteractiveUserSignInLogs
     | where TimeGenerated > ago(1d)
-    | where ResultType == "0"
-    | project AuthTime = TimeGenerated, UserPrincipalName,
-        Auth_IP = IPAddress, Auth_Location = Location,
-        AppDisplayName;
-CAEEvents
-| join kind=inner (NewAuth) on UserPrincipalName
-| where AuthTime between (CAETime .. (CAETime + CAEWindow))
-| where CAE_IP != Auth_IP
+    | where tostring(ResultType) == "0"
+    | where isnotempty(UserId) and isnotempty(IPAddress)
+    | project
+        AuthTime = TimeGenerated,
+        UserId,
+        AuthUPN = UserPrincipalName,
+        AuthIP = IPAddress,
+        AppDisplayName,
+        AuthTable;
+RevokedGrants
+| join kind=inner (SuccessfulAuth) on UserId
+| where AuthTime > RevocationTime
+    and AuthTime <= RevocationTime + CorrelationWindow
+| where RevokedIP != AuthIP
 | project
-    CAETime,
+    TimeGenerated = RevocationTime,
+    RevocationTime,
     AuthTime,
-    UserPrincipalName,
-    CAE_IP,
-    CAE_Location,
-    Auth_IP,
-    Auth_Location,
+    UserId,
+    UserPrincipalName = coalesce(AuthUPN, RevokedUPN),
+    RevokedIP,
+    AuthIP,
     AppDisplayName,
-    TimeDelta = AuthTime - CAETime
+    RevocationTable,
+    AuthTable,
+    TimeDelta = AuthTime - RevocationTime
