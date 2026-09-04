@@ -148,6 +148,7 @@ class SessionHijackScriptContractTests(unittest.TestCase):
                     '{"id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/lab-rg/providers/Microsoft.OperationalInsights/workspaces/lab-law","customerId":"11111111-1111-1111-1111-111111111111","location":"eastus"}'
                 }
                 elseif ($request -match 'onboardingStates') { '{"value":[{"name":"default"}]}' }
+                elseif ($request -match 'cloud show') { 'https://management.azure.com/' }
                 elseif ($request -match 'alertRules') {
                     '{"value":[]}'
                 }

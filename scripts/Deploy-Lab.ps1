@@ -73,6 +73,61 @@ function Get-LabResourceGuid {
     return [guid]::new([byte[]]$hash[0..15]).ToString()
 }
 
+function Get-AllLabAlertRules {
+    param([Parameter(Mandatory)][string]$WorkspaceId)
+
+    # Read the entire collection before treating an ID or name as absent.
+    # Continuations may change the query, never the ARM origin or workspace.
+    $origin = $null
+    $originUrl = az cloud show --query endpoints.resourceManager --output tsv
+    if (-not [uri]::TryCreate($originUrl, [System.UriKind]::Absolute, [ref]$origin) -or
+        $origin.Scheme -ne 'https' -or $origin.Port -ne 443 -or
+        $origin.UserInfo -or $origin.Query -or $origin.Fragment -or $origin.AbsolutePath -ne '/') {
+        throw 'Alert-rule pagination requires a valid HTTPS resource-manager origin from the active Azure cloud.'
+    }
+    $initial = [uri]::new($origin, "$WorkspaceId/providers/Microsoft.SecurityInsights/alertRules?api-version=2024-03-01")
+    $nextUrl = $initial.AbsoluteUri
+    $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $resourceIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $rules = [System.Collections.Generic.List[object]]::new()
+    $pageCount = 0
+
+    while ($nextUrl) {
+        $pageCount++
+        if ($pageCount -gt 100) {
+            throw 'Alert-rule pagination exceeded 100 pages; refusing an incomplete inventory.'
+        }
+        $pageUri = $null
+        if (-not [uri]::TryCreate($initial, $nextUrl, [ref]$pageUri) -or
+            $pageUri.Scheme -ne 'https' -or $pageUri.Host -ne $origin.Host -or
+            $pageUri.Port -ne 443 -or $pageUri.UserInfo -or $pageUri.Fragment -or
+            $pageUri.AbsolutePath -ine $initial.AbsolutePath) {
+            throw 'Alert-rule pagination left the trusted ARM collection; refusing the continuation.'
+        }
+        if (-not $visited.Add($pageUri.AbsoluteUri)) {
+            throw 'Alert-rule pagination repeated a page; refusing an incomplete inventory.'
+        }
+
+        $page = az rest --method GET --url $pageUri.AbsoluteUri 2>$null | ConvertFrom-Json
+        if (-not $page -or $page.value -isnot [array]) {
+            throw 'Alert-rule pagination returned an invalid value array; refusing an incomplete inventory.'
+        }
+        foreach ($rule in $page.value) {
+            if (-not $rule -or $rule.name -isnot [string] -or
+                [string]::IsNullOrWhiteSpace($rule.name) -or -not $resourceIds.Add($rule.name)) {
+                throw 'Alert-rule pagination returned a missing or duplicate resource ID; refusing an ambiguous inventory.'
+            }
+            $rules.Add($rule)
+        }
+        if ($null -ne $page.nextLink -and $page.nextLink -isnot [string]) {
+            throw 'Alert-rule pagination returned an invalid nextLink; refusing the continuation.'
+        }
+        $nextUrl = $page.nextLink
+    }
+
+    return $rules.ToArray()
+}
+
 Write-Host "`n=== Infostealer Session Hijacking Detection Lab ===" -ForegroundColor Cyan
 Write-Host "Resource Group: $ResourceGroup"
 Write-Host "Workspace:      $WorkspaceName"
@@ -106,13 +161,12 @@ Write-Host "  Sentinel: Enabled" -ForegroundColor Green
 if ($Destroy) {
     Write-Host "`nDestroying lab resources..." -ForegroundColor Red
 
-    $existingRulesResponse = az rest --method GET `
-        --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules?api-version=2024-03-01" `
-        2>$null | ConvertFrom-Json
+    $existingRules = @(Get-AllLabAlertRules -WorkspaceId $workspaceId)
+    $ownedRules = @()
 
     foreach ($labRuleName in $LabRuleNames) {
         $expectedRuleId = Get-LabResourceGuid -ResourceKey "rule:$labRuleName"
-        $existingRule = @($existingRulesResponse.value) |
+        $existingRule = $existingRules |
             Where-Object { $_.name -eq $expectedRuleId } |
             Select-Object -First 1
         if ($existingRule) {
@@ -121,13 +175,7 @@ if ($Destroy) {
             if (-not $ownedRule) {
                 throw "Refusing to delete analytics rule '$expectedRuleId': ownership marker or display name does not match this lab."
             }
-            if ($PSCmdlet.ShouldProcess($labRuleName, 'Delete owned Sentinel analytics rule')) {
-                Write-Host "  Deleting rule: $labRuleName"
-                az rest --method DELETE `
-                    --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/${expectedRuleId}?api-version=2024-03-01" `
-                    2>$null | Out-Null
-                Write-Host "    Deleted" -ForegroundColor Green
-            }
+            $ownedRules += @{ Name = $labRuleName; Id = $expectedRuleId }
         }
     }
 
@@ -143,6 +191,19 @@ if ($Destroy) {
         if (-not $ownedWorkbook) {
             throw "Refusing to delete workbook '$expectedWorkbookId': ownership tags do not match this lab."
         }
+    }
+
+    # Finish all ownership checks before the first deletion.
+    foreach ($ownedRule in $ownedRules) {
+        if ($PSCmdlet.ShouldProcess($ownedRule.Name, 'Delete owned Sentinel analytics rule')) {
+            Write-Host "  Deleting rule: $($ownedRule.Name)"
+            az rest --method DELETE `
+                --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/$($ownedRule.Id)?api-version=2024-03-01" `
+                2>$null | Out-Null
+            Write-Host "    Deleted" -ForegroundColor Green
+        }
+    }
+    if ($labWorkbook) {
         if ($PSCmdlet.ShouldProcess($LabWorkbookTitle, 'Delete owned Sentinel workbook')) {
             Write-Host "  Deleting workbook: $LabWorkbookTitle"
             az rest --method DELETE `
@@ -382,23 +443,28 @@ RevokedGrants
     }
 )
 
-$existingRulesResponse = az rest --method GET `
-    --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules?api-version=2024-03-01" `
-    2>$null | ConvertFrom-Json
-foreach ($rule in $rules) {
-    Write-Host "  Deploying: $($rule.displayName)"
-
+$existingRules = @(Get-AllLabAlertRules -WorkspaceId $workspaceId)
+$ruleStates = foreach ($rule in $rules) {
     $ruleId = Get-LabResourceGuid -ResourceKey "rule:$($rule.displayName)"
-    $existingById = @($existingRulesResponse.value) | Where-Object { $_.name -eq $ruleId } | Select-Object -First 1
-    $foreignSameName = @($existingRulesResponse.value) | Where-Object {
+    $existingById = $existingRules | Where-Object { $_.name -eq $ruleId } | Select-Object -First 1
+    $foreignSameName = $existingRules | Where-Object {
         $_.properties.displayName -eq $rule.displayName -and $_.name -ne $ruleId
     } | Select-Object -First 1
     if ($foreignSameName) {
         throw "A non-lab analytics rule already uses '$($rule.displayName)' (ID $($foreignSameName.name)); refusing to overwrite or shadow it."
     }
-    if ($existingById -and $existingById.properties.description -notlike "*$LabOwnerMarker*") {
-        throw "Analytics rule ID '$ruleId' exists without this lab's ownership marker; refusing to overwrite it."
+    if ($existingById -and ($existingById.properties.displayName -ne $rule.displayName -or
+        $existingById.properties.description -notlike "*$LabOwnerMarker*")) {
+        throw "Analytics rule ID '$ruleId' has an unexpected display name or ownership marker; refusing to overwrite it."
     }
+    @{ Definition = $rule; ResourceId = $ruleId; Existing = $existingById }
+}
+
+foreach ($state in $ruleStates) {
+    $rule = $state.Definition
+    $ruleId = $state.ResourceId
+    $existingById = $state.Existing
+    Write-Host "  Deploying: $($rule.displayName)"
 
     $ruleBody = @{
         kind       = "Scheduled"
