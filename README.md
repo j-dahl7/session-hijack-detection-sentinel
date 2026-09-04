@@ -29,13 +29,12 @@ or revoked-grant rows required by every rule.
 - Azure subscription with Microsoft Sentinel enabled
 - Entra ID P2 (for Identity Protection risk scoring)
 - SigninLogs and NonInteractiveUserSignInLogs routed to Sentinel via Entra diagnostic settings
-- Azure CLI + PowerShell 7+
+- Azure CLI + PowerShell 7.4+
 - Permission to read Entra diagnostic settings and workspace logs and to create
   Sentinel rules/workbooks in the named existing workspace
 
 The deployer checks each Azure CLI exit code explicitly. Failed reads and
-deletes remain fatal on supported PowerShell versions even when the optional
-native-error preference is unavailable or disabled.
+deletes remain fatal even when automatic native-error handling is disabled.
 
 The workspace is shared infrastructure. This lab does not create or delete it.
 Existing ingestion, retention, Entra licensing, and Sentinel charges apply.

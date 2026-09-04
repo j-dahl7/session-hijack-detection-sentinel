@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 <#
 .SYNOPSIS
     Deploys the Infostealer Session Hijacking Detection Lab.
@@ -68,15 +68,9 @@ $LabWorkbookTitle = 'Session Hijack Threat Dashboard'
 function Get-LabResourceGuid {
     param([Parameter(Mandatory)][string]$ResourceKey)
 
-    # ComputeHash preserves the same IDs on PowerShell 7.0/.NET Core 3.1,
-    # where the newer static HashData method is unavailable.
-    $algorithm = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $algorithm.ComputeHash(
-            [System.Text.Encoding]::UTF8.GetBytes("$workspaceId|$LabOwnerMarker|$ResourceKey")
-        )
-    }
-    finally { $algorithm.Dispose() }
+    $hash = [System.Security.Cryptography.SHA256]::HashData(
+        [System.Text.Encoding]::UTF8.GetBytes("$workspaceId|$LabOwnerMarker|$ResourceKey")
+    )
     return [guid]::new([byte[]]$hash[0..15]).ToString()
 }
 
