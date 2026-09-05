@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.4
 <#
 .SYNOPSIS
     Deploys the Infostealer Session Hijacking Detection Lab.
@@ -54,6 +54,7 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LabRoot = Split-Path -Parent $ScriptDir
+. (Join-Path $ScriptDir 'Invoke-AzChecked.ps1')
 $LabOwnerMarker = 'nine-lives-zero-trust:session-hijack-detection-sentinel'
 $LabRuleNames = @(
     "LAB - Token Replay from New Device or IP",
@@ -73,6 +74,61 @@ function Get-LabResourceGuid {
     return [guid]::new([byte[]]$hash[0..15]).ToString()
 }
 
+function Get-AllLabAlertRules {
+    param([Parameter(Mandatory)][string]$WorkspaceId)
+
+    # Read the entire collection before treating an ID or name as absent.
+    # Continuations may change the query, never the ARM origin or workspace.
+    $origin = $null
+    $originUrl = Invoke-AzChecked cloud show --query endpoints.resourceManager --output tsv
+    if (-not [uri]::TryCreate($originUrl, [System.UriKind]::Absolute, [ref]$origin) -or
+        $origin.Scheme -ne 'https' -or $origin.Port -ne 443 -or
+        $origin.UserInfo -or $origin.Query -or $origin.Fragment -or $origin.AbsolutePath -ne '/') {
+        throw 'Alert-rule pagination requires a valid HTTPS resource-manager origin from the active Azure cloud.'
+    }
+    $initial = [uri]::new($origin, "$WorkspaceId/providers/Microsoft.SecurityInsights/alertRules?api-version=2024-03-01")
+    $nextUrl = $initial.AbsoluteUri
+    $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $resourceIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $rules = [System.Collections.Generic.List[object]]::new()
+    $pageCount = 0
+
+    while ($nextUrl) {
+        $pageCount++
+        if ($pageCount -gt 100) {
+            throw 'Alert-rule pagination exceeded 100 pages; refusing an incomplete inventory.'
+        }
+        $pageUri = $null
+        if (-not [uri]::TryCreate($initial, $nextUrl, [ref]$pageUri) -or
+            $pageUri.Scheme -ne 'https' -or $pageUri.Host -ne $origin.Host -or
+            $pageUri.Port -ne 443 -or $pageUri.UserInfo -or $pageUri.Fragment -or
+            $pageUri.AbsolutePath -ine $initial.AbsolutePath) {
+            throw 'Alert-rule pagination left the trusted ARM collection; refusing the continuation.'
+        }
+        if (-not $visited.Add($pageUri.AbsoluteUri)) {
+            throw 'Alert-rule pagination repeated a page; refusing an incomplete inventory.'
+        }
+
+        $page = Invoke-AzChecked rest --method GET --url $pageUri.AbsoluteUri 2>$null | ConvertFrom-Json
+        if (-not $page -or $page.value -isnot [array]) {
+            throw 'Alert-rule pagination returned an invalid value array; refusing an incomplete inventory.'
+        }
+        foreach ($rule in $page.value) {
+            if (-not $rule -or $rule.name -isnot [string] -or
+                [string]::IsNullOrWhiteSpace($rule.name) -or -not $resourceIds.Add($rule.name)) {
+                throw 'Alert-rule pagination returned a missing or duplicate resource ID; refusing an ambiguous inventory.'
+            }
+            $rules.Add($rule)
+        }
+        if ($null -ne $page.nextLink -and $page.nextLink -isnot [string]) {
+            throw 'Alert-rule pagination returned an invalid nextLink; refusing the continuation.'
+        }
+        $nextUrl = $page.nextLink
+    }
+
+    return $rules.ToArray()
+}
+
 Write-Host "`n=== Infostealer Session Hijacking Detection Lab ===" -ForegroundColor Cyan
 Write-Host "Resource Group: $ResourceGroup"
 Write-Host "Workspace:      $WorkspaceName"
@@ -80,7 +136,7 @@ Write-Host ""
 
 # --- [0/7] Pre-flight ---
 Write-Host "[0/7] Verifying prerequisites..." -ForegroundColor Yellow
-$workspace = az monitor log-analytics workspace show `
+$workspace = Invoke-AzChecked monitor log-analytics workspace show `
     --resource-group $ResourceGroup `
     --workspace-name $WorkspaceName 2>$null | ConvertFrom-Json
 
@@ -93,7 +149,7 @@ $customerId = $workspace.customerId
 $subscriptionId = ($workspaceId -split '/')[2]
 Write-Host "  Workspace ID: $customerId" -ForegroundColor DarkGray
 
-$sentinel = az rest --method GET `
+$sentinel = Invoke-AzChecked rest --method GET `
     --url "$workspaceId/providers/Microsoft.SecurityInsights/onboardingStates?api-version=2024-03-01" `
     2>$null | ConvertFrom-Json
 
@@ -106,13 +162,12 @@ Write-Host "  Sentinel: Enabled" -ForegroundColor Green
 if ($Destroy) {
     Write-Host "`nDestroying lab resources..." -ForegroundColor Red
 
-    $existingRulesResponse = az rest --method GET `
-        --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules?api-version=2024-03-01" `
-        2>$null | ConvertFrom-Json
+    $existingRules = @(Get-AllLabAlertRules -WorkspaceId $workspaceId)
+    $ownedRules = @()
 
     foreach ($labRuleName in $LabRuleNames) {
         $expectedRuleId = Get-LabResourceGuid -ResourceKey "rule:$labRuleName"
-        $existingRule = @($existingRulesResponse.value) |
+        $existingRule = $existingRules |
             Where-Object { $_.name -eq $expectedRuleId } |
             Select-Object -First 1
         if ($existingRule) {
@@ -121,17 +176,11 @@ if ($Destroy) {
             if (-not $ownedRule) {
                 throw "Refusing to delete analytics rule '$expectedRuleId': ownership marker or display name does not match this lab."
             }
-            if ($PSCmdlet.ShouldProcess($labRuleName, 'Delete owned Sentinel analytics rule')) {
-                Write-Host "  Deleting rule: $labRuleName"
-                az rest --method DELETE `
-                    --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/${expectedRuleId}?api-version=2024-03-01" `
-                    2>$null | Out-Null
-                Write-Host "    Deleted" -ForegroundColor Green
-            }
+            $ownedRules += @{ Name = $labRuleName; Id = $expectedRuleId }
         }
     }
 
-    $existingWorkbooks = az resource list `
+    $existingWorkbooks = Invoke-AzChecked resource list `
         --resource-group $ResourceGroup `
         --resource-type Microsoft.Insights/workbooks `
         2>$null | ConvertFrom-Json
@@ -143,9 +192,22 @@ if ($Destroy) {
         if (-not $ownedWorkbook) {
             throw "Refusing to delete workbook '$expectedWorkbookId': ownership tags do not match this lab."
         }
+    }
+
+    # Finish all ownership checks before the first deletion.
+    foreach ($ownedRule in $ownedRules) {
+        if ($PSCmdlet.ShouldProcess($ownedRule.Name, 'Delete owned Sentinel analytics rule')) {
+            Write-Host "  Deleting rule: $($ownedRule.Name)"
+            Invoke-AzChecked rest --method DELETE `
+                --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/$($ownedRule.Id)?api-version=2024-03-01" `
+                2>$null | Out-Null
+            Write-Host "    Deleted" -ForegroundColor Green
+        }
+    }
+    if ($labWorkbook) {
         if ($PSCmdlet.ShouldProcess($LabWorkbookTitle, 'Delete owned Sentinel workbook')) {
             Write-Host "  Deleting workbook: $LabWorkbookTitle"
-            az rest --method DELETE `
+            Invoke-AzChecked rest --method DELETE `
                 --url "$($labWorkbook.id)?api-version=2022-04-01" `
                 2>$null | Out-Null
             Write-Host "    Deleted" -ForegroundColor Green
@@ -165,7 +227,7 @@ if ($Destroy) {
 if (-not $SkipDiagnostics) {
     Write-Host "`n[1/7] Verifying Entra ID diagnostic settings..." -ForegroundColor Yellow
 
-    $diagSettings = az rest --method GET `
+    $diagSettings = Invoke-AzChecked rest --method GET `
         --url "https://management.azure.com/providers/microsoft.aadiam/diagnosticSettings?api-version=2017-04-01-preview" `
         2>$null | ConvertFrom-Json
 
@@ -206,7 +268,7 @@ if (-not $SkipDiagnostics) {
 # --- [2/7] Data verification ---
 Write-Host "`n[2/7] Verifying sign-in data in workspace..." -ForegroundColor Yellow
 
-$signinCheck = az monitor log-analytics query `
+$signinCheck = Invoke-AzChecked monitor log-analytics query `
     --workspace $customerId `
     --analytics-query "SigninLogs | take 1 | project TimeGenerated" `
     2>$null | ConvertFrom-Json
@@ -217,7 +279,7 @@ if ($signinCheck.Count -gt 0 -and $signinCheck[0].TimeGenerated) {
     Write-Host "  SigninLogs: No data found (may take 15-30 min after enabling diagnostics)" -ForegroundColor Yellow
 }
 
-$nonInteractiveCheck = az monitor log-analytics query `
+$nonInteractiveCheck = Invoke-AzChecked monitor log-analytics query `
     --workspace $customerId `
     --analytics-query "AADNonInteractiveUserSignInLogs | take 1 | project TimeGenerated" `
     2>$null | ConvertFrom-Json
@@ -382,23 +444,28 @@ RevokedGrants
     }
 )
 
-$existingRulesResponse = az rest --method GET `
-    --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules?api-version=2024-03-01" `
-    2>$null | ConvertFrom-Json
-foreach ($rule in $rules) {
-    Write-Host "  Deploying: $($rule.displayName)"
-
+$existingRules = @(Get-AllLabAlertRules -WorkspaceId $workspaceId)
+$ruleStates = foreach ($rule in $rules) {
     $ruleId = Get-LabResourceGuid -ResourceKey "rule:$($rule.displayName)"
-    $existingById = @($existingRulesResponse.value) | Where-Object { $_.name -eq $ruleId } | Select-Object -First 1
-    $foreignSameName = @($existingRulesResponse.value) | Where-Object {
+    $existingById = $existingRules | Where-Object { $_.name -eq $ruleId } | Select-Object -First 1
+    $foreignSameName = $existingRules | Where-Object {
         $_.properties.displayName -eq $rule.displayName -and $_.name -ne $ruleId
     } | Select-Object -First 1
     if ($foreignSameName) {
         throw "A non-lab analytics rule already uses '$($rule.displayName)' (ID $($foreignSameName.name)); refusing to overwrite or shadow it."
     }
-    if ($existingById -and $existingById.properties.description -notlike "*$LabOwnerMarker*") {
-        throw "Analytics rule ID '$ruleId' exists without this lab's ownership marker; refusing to overwrite it."
+    if ($existingById -and ($existingById.properties.displayName -ne $rule.displayName -or
+        $existingById.properties.description -notlike "*$LabOwnerMarker*")) {
+        throw "Analytics rule ID '$ruleId' has an unexpected display name or ownership marker; refusing to overwrite it."
     }
+    @{ Definition = $rule; ResourceId = $ruleId; Existing = $existingById }
+}
+
+foreach ($state in $ruleStates) {
+    $rule = $state.Definition
+    $ruleId = $state.ResourceId
+    $existingById = $state.Existing
+    Write-Host "  Deploying: $($rule.displayName)"
 
     $ruleBody = @{
         kind       = "Scheduled"
@@ -434,7 +501,7 @@ foreach ($rule in $rules) {
         $bodyFile = New-TemporaryFile
         try {
             [System.IO.File]::WriteAllText($bodyFile.FullName, $ruleBody, [System.Text.Encoding]::UTF8)
-            $result = az rest --method PUT `
+            $result = Invoke-AzChecked rest --method PUT `
                 --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/${ruleId}?api-version=2024-03-01" `
                 --body "@$($bodyFile.FullName)" `
                 --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
@@ -465,7 +532,7 @@ $workbookContent = $workbookDefinition | ConvertTo-Json -Depth 100 -Compress
 $workbookDisplayName = $LabWorkbookTitle
 $workbookId = Get-LabResourceGuid -ResourceKey 'workbook'
 $allWorkbooks = @(
-    az resource list `
+    Invoke-AzChecked resource list `
         --resource-group $ResourceGroup `
         --resource-type Microsoft.Insights/workbooks `
         2>$null | ConvertFrom-Json
@@ -500,7 +567,7 @@ if ($PSCmdlet.ShouldProcess($workbookDisplayName, "$workbookAction Sentinel work
     $bodyFile = New-TemporaryFile
     try {
         [System.IO.File]::WriteAllText($bodyFile.FullName, $workbookBody, [System.Text.Encoding]::UTF8)
-        $wbResult = az rest --method PUT `
+        $wbResult = Invoke-AzChecked rest --method PUT `
             --url "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Insights/workbooks/${workbookId}?api-version=2022-04-01" `
             --body "@$($bodyFile.FullName)" `
             --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
