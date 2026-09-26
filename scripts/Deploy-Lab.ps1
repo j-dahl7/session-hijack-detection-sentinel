@@ -63,6 +63,7 @@ $LabRuleNames = @(
     "LAB - Browser or OS Mismatch in Same Session",
     "LAB - Revoked Grant Followed by New-IP Authentication"
 )
+$LegacyRuleNames = @('LAB - CAE Revocation Followed by New Location Auth')
 $LabWorkbookTitle = 'Session Hijack Threat Dashboard'
 
 function Get-LabResourceGuid {
@@ -74,11 +75,7 @@ function Get-LabResourceGuid {
     return [guid]::new([byte[]]$hash[0..15]).ToString()
 }
 
-function Get-AllLabAlertRules {
-    param([Parameter(Mandatory)][string]$WorkspaceId)
-
-    # Read the entire collection before treating an ID or name as absent.
-    # Continuations may change the query, never the ARM origin or workspace.
+function Get-ArmOrigin {
     $origin = $null
     $originUrl = Invoke-AzChecked cloud show --query endpoints.resourceManager --output tsv
     if (-not [uri]::TryCreate($originUrl, [System.UriKind]::Absolute, [ref]$origin) -or
@@ -86,6 +83,15 @@ function Get-AllLabAlertRules {
         $origin.UserInfo -or $origin.Query -or $origin.Fragment -or $origin.AbsolutePath -ne '/') {
         throw 'Alert-rule pagination requires a valid HTTPS resource-manager origin from the active Azure cloud.'
     }
+    return $origin
+}
+
+function Get-AllLabAlertRules {
+    param([Parameter(Mandatory)][string]$WorkspaceId)
+
+    # Read the entire collection before treating an ID or name as absent.
+    # Continuations may change the query, never the ARM origin or workspace.
+    $origin = Get-ArmOrigin
     $initial = [uri]::new($origin, "$WorkspaceId/providers/Microsoft.SecurityInsights/alertRules?api-version=2024-03-01")
     $nextUrl = $initial.AbsoluteUri
     $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
@@ -109,7 +115,7 @@ function Get-AllLabAlertRules {
             throw 'Alert-rule pagination repeated a page; refusing an incomplete inventory.'
         }
 
-        $page = Invoke-AzChecked rest --method GET --url $pageUri.AbsoluteUri 2>$null | ConvertFrom-Json
+        $page = Invoke-AzChecked rest --method GET --url $pageUri.AbsoluteUri | ConvertFrom-Json
         if (-not $page -or $page.value -isnot [array]) {
             throw 'Alert-rule pagination returned an invalid value array; refusing an incomplete inventory.'
         }
@@ -138,20 +144,24 @@ Write-Host ""
 Write-Host "[0/7] Verifying prerequisites..." -ForegroundColor Yellow
 $workspace = Invoke-AzChecked monitor log-analytics workspace show `
     --resource-group $ResourceGroup `
-    --workspace-name $WorkspaceName 2>$null | ConvertFrom-Json
+    --workspace-name $WorkspaceName | ConvertFrom-Json
 
 if (-not $workspace) {
     Write-Error "Workspace '$WorkspaceName' not found in resource group '$ResourceGroup'"
 }
 
 $workspaceId = $workspace.id
+if ($workspaceId -isnot [string] -or $workspaceId -notmatch '^/subscriptions/[0-9a-fA-F-]{36}/resourceGroups/[^/%?#]+/providers/Microsoft[.]OperationalInsights/workspaces/[A-Za-z0-9-]+$') {
+    throw 'Workspace response did not contain a canonical workspace resource ID.'
+}
+$labArmOrigin = Get-ArmOrigin
 $customerId = $workspace.customerId
 $subscriptionId = ($workspaceId -split '/')[2]
 Write-Host "  Workspace ID: $customerId" -ForegroundColor DarkGray
 
 $sentinel = Invoke-AzChecked rest --method GET `
     --url "$workspaceId/providers/Microsoft.SecurityInsights/onboardingStates?api-version=2024-03-01" `
-    2>$null | ConvertFrom-Json
+    | ConvertFrom-Json
 
 if (-not $sentinel.value) {
     Write-Error "Microsoft Sentinel is not enabled on workspace '$WorkspaceName'"
@@ -165,7 +175,7 @@ if ($Destroy) {
     $existingRules = @(Get-AllLabAlertRules -WorkspaceId $workspaceId)
     $ownedRules = @()
 
-    foreach ($labRuleName in $LabRuleNames) {
+    foreach ($labRuleName in @($LabRuleNames + $LegacyRuleNames)) {
         $expectedRuleId = Get-LabResourceGuid -ResourceKey "rule:$labRuleName"
         $existingRule = $existingRules |
             Where-Object { $_.name -eq $expectedRuleId } |
@@ -178,12 +188,15 @@ if ($Destroy) {
             }
             $ownedRules += @{ Name = $labRuleName; Id = $expectedRuleId }
         }
+        elseif (@($existingRules | Where-Object { $_.properties.displayName -eq $labRuleName }).Count) {
+            Write-Warning "A rule named '$labRuleName' has a different ID. It is outside this lab's ownership proof and needs manual review; it will not be deleted."
+        }
     }
 
     $existingWorkbooks = Invoke-AzChecked resource list `
         --resource-group $ResourceGroup `
         --resource-type Microsoft.Insights/workbooks `
-        2>$null | ConvertFrom-Json
+        | ConvertFrom-Json
     $expectedWorkbookId = Get-LabResourceGuid -ResourceKey 'workbook'
     $labWorkbook = $existingWorkbooks | Where-Object { $_.name -eq $expectedWorkbookId } | Select-Object -First 1
     if ($labWorkbook) {
@@ -200,7 +213,7 @@ if ($Destroy) {
             Write-Host "  Deleting rule: $($ownedRule.Name)"
             Invoke-AzChecked rest --method DELETE `
                 --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/$($ownedRule.Id)?api-version=2024-03-01" `
-                2>$null | Out-Null
+                | Out-Null
             Write-Host "    Deleted" -ForegroundColor Green
         }
     }
@@ -209,7 +222,7 @@ if ($Destroy) {
             Write-Host "  Deleting workbook: $LabWorkbookTitle"
             Invoke-AzChecked rest --method DELETE `
                 --url "$($labWorkbook.id)?api-version=2022-04-01" `
-                2>$null | Out-Null
+                | Out-Null
             Write-Host "    Deleted" -ForegroundColor Green
         }
     }
@@ -228,8 +241,8 @@ if (-not $SkipDiagnostics) {
     Write-Host "`n[1/7] Verifying Entra ID diagnostic settings..." -ForegroundColor Yellow
 
     $diagSettings = Invoke-AzChecked rest --method GET `
-        --url "https://management.azure.com/providers/microsoft.aadiam/diagnosticSettings?api-version=2017-04-01-preview" `
-        2>$null | ConvertFrom-Json
+        --url "$($labArmOrigin.AbsoluteUri.TrimEnd('/'))/providers/microsoft.aadiam/diagnosticSettings?api-version=2017-04-01-preview" `
+        | ConvertFrom-Json
 
     $requiredCategories = @("SignInLogs", "NonInteractiveUserSignInLogs")
     $missingCategories = @()
@@ -240,7 +253,7 @@ if (-not $SkipDiagnostics) {
             $enabledLogs = @($setting.properties.logs | Where-Object { $_.enabled -eq $true })
             if ($enabledLogs.category -contains $cat) {
                 $targetWs = $setting.properties.workspaceId
-                if ($targetWs -and $targetWs -like "*$WorkspaceName*") {
+                if ($targetWs -is [string] -and $targetWs.TrimEnd('/') -ieq $workspaceId.TrimEnd('/')) {
                     $found = $true
                     break
                 }
@@ -265,13 +278,19 @@ if (-not $SkipDiagnostics) {
     Write-Host "`n[1/7] Skipping diagnostic settings check (-SkipDiagnostics)" -ForegroundColor DarkGray
 }
 
+# Query support must be present before any resource write; never install it implicitly.
+$extensions = @(Invoke-AzChecked extension list --output json | ConvertFrom-Json)
+if (@($extensions | Where-Object { $_.name -eq 'log-analytics' }).Count -ne 1) {
+    throw 'Install the query prerequisite explicitly: az extension add --name log-analytics'
+}
+
 # --- [2/7] Data verification ---
 Write-Host "`n[2/7] Verifying sign-in data in workspace..." -ForegroundColor Yellow
 
 $signinCheck = Invoke-AzChecked monitor log-analytics query `
     --workspace $customerId `
     --analytics-query "SigninLogs | take 1 | project TimeGenerated" `
-    2>$null | ConvertFrom-Json
+    | ConvertFrom-Json
 
 if ($signinCheck.Count -gt 0 -and $signinCheck[0].TimeGenerated) {
     Write-Host "  SigninLogs: Data present" -ForegroundColor Green
@@ -282,7 +301,7 @@ if ($signinCheck.Count -gt 0 -and $signinCheck[0].TimeGenerated) {
 $nonInteractiveCheck = Invoke-AzChecked monitor log-analytics query `
     --workspace $customerId `
     --analytics-query "AADNonInteractiveUserSignInLogs | take 1 | project TimeGenerated" `
-    2>$null | ConvertFrom-Json
+    | ConvertFrom-Json
 
 if ($nonInteractiveCheck.Count -gt 0 -and $nonInteractiveCheck[0].TimeGenerated) {
     Write-Host "  AADNonInteractiveUserSignInLogs: Data present" -ForegroundColor Green
@@ -310,22 +329,26 @@ let MinUnfamiliarEvents = 1;
 let KnownUserFootprint = AADNonInteractiveUserSignInLogs
     | where TimeGenerated between (ago(LookbackPeriod) .. ago(DetectionWindow))
     | where ResultType == "0"
+| where isnotempty(UserId)
     | extend DeviceId = tostring(parse_json(DeviceDetail).deviceId)
-    | summarize by UserPrincipalName, IPAddress, DeviceId
+    | summarize by UserId, IPAddress, DeviceId
     | extend Known = true;
 AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(DetectionWindow)
 | where ResultType == "0"
+| where isnotempty(UserId)
 | where isnotempty(UserPrincipalName)
 | extend DeviceId = tostring(parse_json(DeviceDetail).deviceId)
 | extend OS = tostring(parse_json(DeviceDetail).operatingSystem)
 | extend Browser = tostring(parse_json(DeviceDetail).browser)
+| extend ArrivalTime = coalesce(ingestion_time(), TimeGenerated)
 | join kind=leftouter (KnownUserFootprint)
-    on UserPrincipalName, IPAddress, DeviceId
+    on UserId, IPAddress, DeviceId
 | extend IsUnfamiliar = isnull(Known)
-| summarize UnfamiliarEvents = countif(IsUnfamiliar), NewIPCount = dcountif(IPAddress, IsUnfamiliar), IPs = make_set_if(IPAddress, IsUnfamiliar, 10), Apps = make_set_if(AppDisplayName, IsUnfamiliar, 10), OS_Set = make_set_if(OS, IsUnfamiliar, 5), Browser_Set = make_set_if(Browser, IsUnfamiliar, 5), EventCount = count() by UserPrincipalName, bin(TimeGenerated, 1h)
+| summarize LatestEvidence = maxif(ArrivalTime, IsUnfamiliar), UnfamiliarEvents = countif(IsUnfamiliar), NewIPCount = dcountif(IPAddress, IsUnfamiliar), IPs = make_set_if(IPAddress, IsUnfamiliar, 10), Apps = make_set_if(AppDisplayName, IsUnfamiliar, 10), OS_Set = make_set_if(OS, IsUnfamiliar, 5), Browser_Set = make_set_if(Browser, IsUnfamiliar, 5), EventCount = count() by UserId, UserPrincipalName, bin(TimeGenerated, 1h)
 | where UnfamiliarEvents >= MinUnfamiliarEvents
-| project TimeGenerated, UserPrincipalName, UnfamiliarEvents, NewIPCount, IPs, Apps, OS_Set, Browser_Set, EventCount
+| where LatestEvidence > ago(1h)
+| project TimeGenerated, UserId, UserPrincipalName, UnfamiliarEvents, NewIPCount, IPs, Apps, OS_Set, Browser_Set, EventCount
 "@
         # LookbackPeriod is 14d, so the rule must be able to see 14 days. Under the
         # default P1D the KnownUserFootprint subquery resolves to an empty set, the
@@ -334,7 +357,6 @@ AADNonInteractiveUserSignInLogs
         queryPeriod    = "P14D"
         tactics        = @("CredentialAccess", "LateralMovement")
         techniques     = @("T1539", "T1550")
-        subTechniques  = @("T1550.001")
     },
     @{
         displayName = "LAB - Impossible Travel on Token Refresh"
@@ -346,25 +368,28 @@ let MinDistanceKm = 100;
 AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(1d)
 | where ResultType == "0"
+| where isnotempty(UserId)
 | extend LocDetails = parse_json(tostring(LocationDetails))
 | extend Lat = toreal(LocDetails.geoCoordinates.latitude)
 | extend Lon = toreal(LocDetails.geoCoordinates.longitude)
 | extend City = tostring(LocDetails.city)
 | extend Country = tostring(LocDetails.countryOrRegion)
 | where isnotnull(Lat) and isnotnull(Lon)
-| sort by UserPrincipalName asc, TimeGenerated asc
-| extend PrevLat = prev(Lat, 1), PrevLon = prev(Lon, 1), PrevTime = prev(TimeGenerated, 1), PrevUser = prev(UserPrincipalName, 1), PrevCity = prev(City, 1), PrevCountry = prev(Country, 1)
-| where UserPrincipalName == PrevUser
-| extend TimeDeltaHours = datetime_diff('second', TimeGenerated, PrevTime) / 3600.0
-| where TimeDeltaHours > 0
+| extend ArrivalTime = coalesce(ingestion_time(), TimeGenerated)
+| sort by UserId asc, TimeGenerated asc
+| extend PrevLat = prev(Lat, 1), PrevLon = prev(Lon, 1), PrevTime = prev(TimeGenerated, 1), PrevUser = prev(UserId, 1), PrevArrivalTime = prev(ArrivalTime, 1), PrevCity = prev(City, 1), PrevCountry = prev(Country, 1)
+| where UserId == PrevUser
+| where max_of(ArrivalTime, PrevArrivalTime) > ago(1h)
+| extend TimeDeltaHours = (TimeGenerated - PrevTime) / 1h
+| where TimeDeltaHours >= 0
 | extend DistanceKm = geo_distance_2points(Lon, Lat, PrevLon, PrevLat) / 1000.0
-| extend SpeedKmH = DistanceKm / TimeDeltaHours
-| where SpeedKmH > SpeedThresholdKmH and DistanceKm > MinDistanceKm
-| project TimeGenerated, UserPrincipalName, FromCity = PrevCity, FromCountry = PrevCountry, ToCity = City, ToCountry = Country, DistanceKm = round(DistanceKm, 0), TimeDeltaMinutes = round(TimeDeltaHours * 60, 1), SpeedKmH = round(SpeedKmH, 0), AppDisplayName, IPAddress
+| extend Simultaneous = TimeDeltaHours == 0
+| extend SpeedKmH = iff(Simultaneous, real(null), DistanceKm / TimeDeltaHours)
+| where (Simultaneous or SpeedKmH > SpeedThresholdKmH) and DistanceKm > MinDistanceKm
+| project TimeGenerated, UserId, UserPrincipalName, FromCity = PrevCity, FromCountry = PrevCountry, ToCity = City, ToCountry = Country, DistanceKm = round(DistanceKm, 0), Simultaneous, TimeDeltaMinutes = round(TimeDeltaHours * 60, 1), SpeedKmH = round(SpeedKmH, 0), AppDisplayName, IPAddress
 "@
         tactics        = @("CredentialAccess", "InitialAccess")
         techniques     = @("T1539")
-        subTechniques  = @()
     },
     @{
         displayName = "LAB - Anomalous Non-Interactive Sign-in Surge"
@@ -378,20 +403,23 @@ let MinAbsoluteThreshold = 20;
 let Baseline = AADNonInteractiveUserSignInLogs
     | where TimeGenerated between (ago(BaselinePeriod) .. ago(DetectionWindow))
     | where ResultType == "0"
-    | summarize BaselineHourlyAvg = count() / (24.0 * 7) by UserPrincipalName;
+| where isnotempty(UserId)
+    | summarize BaselineHourlyAvg = count() / (24.0 * 7) by UserId;
 AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(DetectionWindow)
 | where ResultType == "0"
-| summarize CurrentCount = count(), DistinctApps = dcount(AppDisplayName), Apps = make_set(AppDisplayName, 15), DistinctIPs = dcount(IPAddress), IPs = make_set(IPAddress, 10) by UserPrincipalName
-| join kind=inner (Baseline) on UserPrincipalName
+| where isnotempty(UserId)
+| extend ArrivalTime = coalesce(ingestion_time(), TimeGenerated)
+| summarize LatestEvidence = max(ArrivalTime), CurrentCount = count(), DistinctApps = dcount(AppDisplayName), Apps = make_set(AppDisplayName, 15), DistinctIPs = dcount(IPAddress), IPs = make_set(IPAddress, 10) by UserId, UserPrincipalName
+| join kind=inner (Baseline) on UserId
 | where CurrentCount > BaselineHourlyAvg * SpikeMultiplier and CurrentCount > MinAbsoluteThreshold
 | extend SpikeRatio = round(CurrentCount / BaselineHourlyAvg, 1)
-| project TimeGenerated = now(), UserPrincipalName, CurrentCount, BaselineHourlyAvg = round(BaselineHourlyAvg, 1), SpikeRatio, DistinctApps, Apps, DistinctIPs, IPs
+| where LatestEvidence > ago(1h)
+| project TimeGenerated = now(), UserId, UserPrincipalName, CurrentCount, BaselineHourlyAvg = round(BaselineHourlyAvg, 1), SpikeRatio, DistinctApps, Apps, DistinctIPs, IPs
 "@
         queryPeriod    = "P7D"
         tactics        = @("CredentialAccess", "LateralMovement")
         techniques     = @("T1539", "T1550")
-        subTechniques  = @("T1550.001")
     },
     @{
         displayName = "LAB - Browser or OS Mismatch in Same Session"
@@ -403,18 +431,20 @@ let TimeWindowHours = 4h;
 AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(1d)
 | where ResultType == "0"
+| where isnotempty(UserId)
 | where isnotempty(UserPrincipalName) and isnotempty(SessionId)
 | extend OS = tostring(parse_json(DeviceDetail).operatingSystem)
 | extend Browser = tostring(parse_json(DeviceDetail).browser)
 | where isnotempty(OS) and isnotempty(Browser)
 | extend Fingerprint = strcat(OS, "|", Browser)
-| summarize DistinctFingerprints = dcount(Fingerprint), Fingerprints = make_set(Fingerprint, 10), DistinctIPs = dcount(IPAddress), IPs = make_set(IPAddress, 10), Apps = make_set(AppDisplayName, 10), EventCount = count() by UserPrincipalName, SessionId, bin(TimeGenerated, TimeWindowHours)
+| extend ArrivalTime = coalesce(ingestion_time(), TimeGenerated)
+| summarize LatestEvidence = max(ArrivalTime), DistinctFingerprints = dcount(Fingerprint), Fingerprints = make_set(Fingerprint, 10), DistinctIPs = dcount(IPAddress), IPs = make_set(IPAddress, 10), Apps = make_set(AppDisplayName, 10), EventCount = count() by UserId, UserPrincipalName, SessionId, bin(TimeGenerated, TimeWindowHours)
 | where DistinctFingerprints >= FingerprintThreshold
-| project TimeGenerated, UserPrincipalName, SessionId, DistinctFingerprints, Fingerprints, DistinctIPs, IPs, Apps, EventCount
+| where LatestEvidence > ago(1h)
+| project TimeGenerated, UserId, UserPrincipalName, SessionId, DistinctFingerprints, Fingerprints, DistinctIPs, IPs, Apps, EventCount
 "@
         tactics        = @("DefenseEvasion", "CredentialAccess")
         techniques     = @("T1539", "T1550")
-        subTechniques  = @("T1550.001")
     },
     @{
         displayName = "LAB - Revoked Grant Followed by New-IP Authentication"
@@ -426,25 +456,31 @@ let RevokedGrants = union withsource=RevocationTable isfuzzy=true SigninLogs, AA
     | where TimeGenerated > ago(1d)
     | where tostring(ResultType) == "50173"
     | where isnotempty(UserId) and isnotempty(IPAddress)
-    | project RevocationTime = TimeGenerated, UserId, RevokedUPN = UserPrincipalName, RevokedIP = IPAddress, RevocationTable;
+    | project RevocationArrival = coalesce(ingestion_time(), TimeGenerated), RevocationTime = TimeGenerated, UserId, RevokedUPN = UserPrincipalName, RevokedIP = IPAddress, RevocationTable;
 let SuccessfulAuth = union withsource=AuthTable isfuzzy=true SigninLogs, AADNonInteractiveUserSignInLogs
     | where TimeGenerated > ago(1d)
     | where tostring(ResultType) == "0"
     | where isnotempty(UserId) and isnotempty(IPAddress)
-    | project AuthTime = TimeGenerated, UserId, AuthUPN = UserPrincipalName, AuthIP = IPAddress, AppDisplayName, AuthTable;
+    | project AuthArrival = coalesce(ingestion_time(), TimeGenerated), AuthTime = TimeGenerated, UserId, AuthUPN = UserPrincipalName, AuthIP = IPAddress, AppDisplayName, AuthTable;
 RevokedGrants
 | join kind=inner (SuccessfulAuth) on UserId
 | where AuthTime > RevocationTime and AuthTime <= RevocationTime + CorrelationWindow
 | where RevokedIP != AuthIP
+| where max_of(RevocationArrival, AuthArrival) > ago(1h)
 | project TimeGenerated = RevocationTime, RevocationTime, AuthTime, UserId, UserPrincipalName = coalesce(AuthUPN, RevokedUPN), RevokedIP, AuthIP, AppDisplayName, RevocationTable, AuthTable, TimeDelta = AuthTime - RevocationTime
 "@
         tactics        = @("CredentialAccess", "Persistence", "LateralMovement")
         techniques     = @("T1539", "T1550")
-        subTechniques  = @("T1550.001")
     }
 )
 
 $existingRules = @(Get-AllLabAlertRules -WorkspaceId $workspaceId)
+foreach ($legacyName in $LegacyRuleNames) {
+    $legacyId = Get-LabResourceGuid -ResourceKey "rule:$legacyName"
+    if (@($existingRules | Where-Object { $_.name -eq $legacyId -or $_.properties.displayName -eq $legacyName }).Count) {
+        throw "Legacy rule '$legacyName' remains. Preview -Destroy and verify ownership before redeploying; unmarked resources require manual review."
+    }
+}
 $ruleStates = foreach ($rule in $rules) {
     $ruleId = Get-LabResourceGuid -ResourceKey "rule:$($rule.displayName)"
     $existingById = $existingRules | Where-Object { $_.name -eq $ruleId } | Select-Object -First 1
@@ -461,69 +497,7 @@ $ruleStates = foreach ($rule in $rules) {
     @{ Definition = $rule; ResourceId = $ruleId; Existing = $existingById }
 }
 
-foreach ($state in $ruleStates) {
-    $rule = $state.Definition
-    $ruleId = $state.ResourceId
-    $existingById = $state.Existing
-    Write-Host "  Deploying: $($rule.displayName)"
-
-    $ruleBody = @{
-        kind       = "Scheduled"
-        properties = @{
-            displayName           = $rule.displayName
-            description           = "$($rule.description) [Owner: $LabOwnerMarker]"
-            severity              = $rule.severity
-            query                 = $rule.query
-            queryFrequency        = "PT1H"
-            queryPeriod           = if ($rule.queryPeriod) { $rule.queryPeriod } else { "P1D" }
-            triggerOperator       = "GreaterThan"
-            triggerThreshold      = 0
-            suppressionDuration   = "PT5H"
-            suppressionEnabled    = $false
-            tactics               = $rule.tactics
-            techniques            = $rule.techniques
-            subTechniques         = $rule.subTechniques
-            enabled               = $true
-            incidentConfiguration = @{
-                createIncident        = $true
-                groupingConfiguration = @{
-                    enabled               = $true
-                    reopenClosedIncident  = $false
-                    lookbackDuration      = "PT5H"
-                    matchingMethod        = "AllEntities"
-                }
-            }
-        }
-    } | ConvertTo-Json -Depth 10
-
-    $ruleAction = if ($existingById) { "Updated" } else { "Created" }
-    if ($PSCmdlet.ShouldProcess($rule.displayName, "$ruleAction Sentinel analytics rule")) {
-        $bodyFile = New-TemporaryFile
-        try {
-            [System.IO.File]::WriteAllText($bodyFile.FullName, $ruleBody, [System.Text.Encoding]::UTF8)
-            $result = Invoke-AzChecked rest --method PUT `
-                --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/${ruleId}?api-version=2024-03-01" `
-                --body "@$($bodyFile.FullName)" `
-                --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
-
-            if (-not $result.name) {
-                throw "Sentinel did not return an analytics rule resource"
-            }
-            Write-Host "    ${ruleAction}: $($result.name)" -ForegroundColor Green
-        }
-        finally {
-            Remove-Item $bodyFile.FullName -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-# --- [4/7] Hunting queries ---
-Write-Host "`n[4/7] Hunting queries available at:" -ForegroundColor Yellow
-Write-Host "  $LabRoot/detection/hunting-queries.kql" -ForegroundColor DarkGray
-
-# --- [5/7] Deploy Workbook ---
-Write-Host "`n[5/7] Deploying Sentinel workbook..." -ForegroundColor Yellow
-
+# Complete workbook ownership preflight before the first rule write.
 $workbookContentPath = "$LabRoot/workbook/session-hijack-workbook.json"
 $workbookDefinition = Get-Content -Path $workbookContentPath -Raw | ConvertFrom-Json
 $workbookDefinition.fallbackResourceIds = @($workspaceId)
@@ -535,7 +509,7 @@ $allWorkbooks = @(
     Invoke-AzChecked resource list `
         --resource-group $ResourceGroup `
         --resource-type Microsoft.Insights/workbooks `
-        2>$null | ConvertFrom-Json
+        | ConvertFrom-Json
 )
 $existingWorkbook = $allWorkbooks | Where-Object { $_.name -eq $workbookId } | Select-Object -First 1
 $foreignSameTitleWorkbook = $allWorkbooks | Where-Object {
@@ -563,6 +537,87 @@ $workbookBody = @{
     }
 } | ConvertTo-Json -Depth 10
 
+
+foreach ($state in $ruleStates) {
+    $rule = $state.Definition
+    $ruleId = $state.ResourceId
+    $existingById = $state.Existing
+    Write-Host "  Deploying: $($rule.displayName)"
+
+    $ruleBody = @{
+        kind       = "Scheduled"
+        properties = @{
+            displayName           = $rule.displayName
+            description           = "$($rule.description) [Owner: $LabOwnerMarker]"
+            severity              = $rule.severity
+            query                 = $rule.query
+            queryFrequency        = "PT1H"
+            queryPeriod           = if ($rule.queryPeriod) { $rule.queryPeriod } else { "P1D" }
+            triggerOperator       = "GreaterThan"
+            triggerThreshold      = 0
+            suppressionDuration   = "PT5H"
+            suppressionEnabled    = $false
+            tactics               = $rule.tactics
+            techniques            = $rule.techniques
+            eventGroupingSettings = @{ aggregationKind = 'AlertPerResult' }
+            entityMappings        = @(@{
+                entityType = 'Account'
+                fieldMappings = @(@{ identifier = 'AadUserId'; columnName = 'UserId' })
+            }) + $(if ($rule.displayName -eq $LabRuleNames[1]) {
+                @(@{ entityType = 'IP'; fieldMappings = @(@{ identifier = 'Address'; columnName = 'IPAddress' }) })
+            } elseif ($rule.displayName -eq $LabRuleNames[4]) {
+                @(@{ entityType = 'IP'; fieldMappings = @(@{ identifier = 'Address'; columnName = 'AuthIP' }) })
+            } else { @() })
+            enabled               = $true
+            incidentConfiguration = @{
+                createIncident        = $true
+                groupingConfiguration = @{
+                    eventGroupingSettings = @{ aggregationKind = 'AlertPerResult' }
+            entityMappings        = @(@{
+                entityType = 'Account'
+                fieldMappings = @(@{ identifier = 'AadUserId'; columnName = 'UserId' })
+            }) + $(if ($rule.displayName -eq $LabRuleNames[1]) {
+                @(@{ entityType = 'IP'; fieldMappings = @(@{ identifier = 'Address'; columnName = 'IPAddress' }) })
+            } elseif ($rule.displayName -eq $LabRuleNames[4]) {
+                @(@{ entityType = 'IP'; fieldMappings = @(@{ identifier = 'Address'; columnName = 'AuthIP' }) })
+            } else { @() })
+            enabled               = $true
+                    reopenClosedIncident  = $false
+                    lookbackDuration      = "PT5H"
+                    matchingMethod        = "AllEntities"
+                }
+            }
+        }
+    } | ConvertTo-Json -Depth 10
+
+    $ruleAction = if ($existingById) { "Updated" } else { "Created" }
+    if ($PSCmdlet.ShouldProcess($rule.displayName, "$ruleAction Sentinel analytics rule")) {
+        $bodyFile = New-TemporaryFile
+        try {
+            [System.IO.File]::WriteAllText($bodyFile.FullName, $ruleBody, [System.Text.Encoding]::UTF8)
+            $result = Invoke-AzChecked rest --method PUT `
+                --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/${ruleId}?api-version=2024-03-01" `
+                --body "@$($bodyFile.FullName)" `
+                --headers 'Content-Type=application/json' | ConvertFrom-Json
+
+            if (-not $result.name) {
+                throw "Sentinel did not return an analytics rule resource"
+            }
+            Write-Host "    ${ruleAction}: $($result.name)" -ForegroundColor Green
+        }
+        finally {
+            Remove-Item $bodyFile.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# --- [4/7] Hunting queries ---
+Write-Host "`n[4/7] Hunting queries available at:" -ForegroundColor Yellow
+Write-Host "  $LabRoot/detection/hunting-queries.kql" -ForegroundColor DarkGray
+
+# --- [5/7] Deploy Workbook ---
+Write-Host "`n[5/7] Deploying Sentinel workbook..." -ForegroundColor Yellow
+
 if ($PSCmdlet.ShouldProcess($workbookDisplayName, "$workbookAction Sentinel workbook")) {
     $bodyFile = New-TemporaryFile
     try {
@@ -570,7 +625,7 @@ if ($PSCmdlet.ShouldProcess($workbookDisplayName, "$workbookAction Sentinel work
         $wbResult = Invoke-AzChecked rest --method PUT `
             --url "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Insights/workbooks/${workbookId}?api-version=2022-04-01" `
             --body "@$($bodyFile.FullName)" `
-            --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
+            --headers 'Content-Type=application/json' | ConvertFrom-Json
 
         if (-not $wbResult.name) {
             throw "Azure did not return a workbook resource"

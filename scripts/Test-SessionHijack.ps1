@@ -138,10 +138,14 @@ try {
     Write-Host "  Could not determine public IP" -ForegroundColor Yellow
 }
 
-$meInfo = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/me?`$select=displayName,userPrincipalName" `
-    -Headers $headers -ErrorAction SilentlyContinue
-if ($meInfo) {
-    Write-Host "  Signed in as: $($meInfo.userPrincipalName)" -ForegroundColor DarkGray
+try {
+    $meInfo = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/me?`$select=displayName,userPrincipalName" `
+        -Headers $headers -ErrorAction Stop
+    if ($meInfo) {
+        Write-Host "  Signed in as: $($meInfo.userPrincipalName)" -ForegroundColor DarkGray
+    }
+} catch {
+    Write-Warning 'Optional identity lookup failed; earlier request outcomes are unchanged. Check Graph availability or throttling before retrying.'
 }
 Write-Host ""
 

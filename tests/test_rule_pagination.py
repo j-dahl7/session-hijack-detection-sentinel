@@ -38,6 +38,7 @@ function New-Rule([string]$Name, [bool]$Owned = $true) {
 }
 
 function global:az {
+    if (($args -join ' ') -match '^extension list') { return '[{"name":"log-analytics"}]' }
     $request = $args -join ' '
     $global:Calls.Add($request)
     if ($request -match 'monitor log-analytics workspace show') {

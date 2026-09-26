@@ -36,7 +36,7 @@ AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(7d)
 | where ResultType == "0"
 | extend HourOfDay = hourofday(TimeGenerated)
-| where HourOfDay >= 22 or HourOfDay <= 6
+| where HourOfDay >= 22 or HourOfDay < 6
 | summarize
     OffHoursCount = count(),
     DistinctIPs = dcount(IPAddress),
