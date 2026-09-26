@@ -47,11 +47,11 @@ class SessionHijackScriptContractTests(unittest.TestCase):
             self.deploy_source,
         )
         self.assertIn(
-            "by UserPrincipalName, SessionId, bin(TimeGenerated, TimeWindowHours)",
+            "by UserId, UserPrincipalName, SessionId, bin(TimeGenerated, TimeWindowHours)",
             self.deploy_source,
         )
         self.assertIn(
-            "project TimeGenerated, UserPrincipalName, SessionId, DistinctFingerprints",
+            "project TimeGenerated, UserId, UserPrincipalName, SessionId, DistinctFingerprints",
             self.deploy_source,
         )
 
@@ -139,6 +139,7 @@ class SessionHijackScriptContractTests(unittest.TestCase):
             $ErrorActionPreference = 'Stop'
             $script:Mutations = @()
             function global:az {
+    if (($args -join ' ') -match '^extension list') { return '[{"name":"log-analytics"}]' }
                 $request = $args -join ' '
                 if ($request -match '(--method PUT|--method DELETE|deployment .* create)') {
                     $script:Mutations += $request

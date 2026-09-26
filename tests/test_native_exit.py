@@ -28,6 +28,7 @@ class NativeExitTests(unittest.TestCase):
             $ErrorActionPreference='Stop'
             . (Join-Path $env:LAB_ROOT 'scripts/Invoke-AzChecked.ps1')
             function global:az {
+    if (($args -join ' ') -match '^extension list') { return '[{"name":"log-analytics"}]' }
                 & $env:NATIVE_PYTHON -c 'import sys; print("failed-output-sentinel"); sys.exit(int(sys.argv[1]))' $env:MOCK_EXIT
             }
             foreach($preference in @($false,$true)) {
@@ -56,6 +57,7 @@ class NativeExitTests(unittest.TestCase):
             $global:ruleId=[guid]::new([byte[]]$bytes[0..15]).ToString()
             $global:deletes=0
             function global:az {
+    if (($args -join ' ') -match '^extension list') { return '[{"name":"log-analytics"}]' }
                 $request=$args -join ' '
                 if ($request -match '^monitor log-analytics workspace show') { return (@{id=$global:workspaceId;customerId='customer-1';location='eastus'} | ConvertTo-Json -Compress) }
                 if ($request -match 'onboardingStates') { return '{"value":[{"name":"default"}]}' }

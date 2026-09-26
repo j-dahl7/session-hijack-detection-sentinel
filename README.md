@@ -30,11 +30,19 @@ or revoked-grant rows required by every rule.
 - Entra ID P2 (for Identity Protection risk scoring)
 - SigninLogs and NonInteractiveUserSignInLogs routed to Sentinel via Entra diagnostic settings
 - Azure CLI + PowerShell 7.4+
+- The explicitly installed `log-analytics` CLI extension (`az extension add --name log-analytics`)
 - Permission to read Entra diagnostic settings and workspace logs and to create
   Sentinel rules/workbooks in the named existing workspace
 
 The deployer checks each Azure CLI exit code explicitly. Failed reads and
 deletes remain fatal even when automatic native-error handling is disabled.
+Azure CLI stderr remains visible for troubleshooting; avoid sharing raw command
+logs without reviewing them. The diagnostics check uses the active Azure cloud's
+ARM origin and compares the full workspace resource ID, not a name substring.
+
+All rule and workbook ownership conflicts are checked before the first write.
+This reduces known partial-deployment failures; it is not an atomic transaction
+against concurrent changes by another operator.
 
 The workspace is shared infrastructure. This lab does not create or delete it.
 Existing ingestion, retention, Entra licensing, and Sentinel charges apply.
@@ -58,12 +66,46 @@ but guarded rule/workbook writes are skipped. `-Destroy -WhatIf` lists and
 validates deterministic IDs and ownership markers without deleting them.
 Neither preview validates live rule output.
 
+Cleanup also recognizes the deterministic ID and ownership marker of the prior
+`LAB - CAE Revocation Followed by New Location Auth` rule. An upgrade stops if
+that legacy rule remains, so preview cleanup before redeploying the current rule.
+Resources with a matching title but an unknown ID or missing marker are never
+adopted or deleted automatically; inspect those older deployments manually.
+
 Deployment parameters are `-ResourceGroup`, `-WorkspaceName`,
 `-SkipDiagnostics`, `-SkipSentinel`, `-Destroy`, and PowerShell's common
 `-WhatIf` switch. The helper accepts `-TenantId`, `-BurstCount` (default 30),
 and `-SkipBurst`.
 
 ## Validation Expectations
+
+The September 25 source revision adds offline tests of exact diagnostic targets,
+preflight failure ordering, legacy cleanup, emitted entity mappings, and optional
+Graph failures. CI also parses and binds all five actual deployed KQL queries
+with checksum-pinned Microsoft Kusto Language tooling. These are source and
+mocked-transport checks, not a new Sentinel deployment or live detection result.
+
+Scheduled rules retain their historical correlation windows and gate output on
+source evidence ingested in the last hour (falling back to event time only when
+ingestion time is unavailable). Rule 1 considers newly arrived *unfamiliar*
+evidence; Rule 5 considers either side of the correlation, including a late
+revocation record. This avoids repeating unchanged day-old matches on every
+hourly run. New evidence can still update an existing group; this is not an
+exactly-once guarantee, and outages or irregular scheduling need independent
+replay and tenant validation. The 14-day and 7-day baselines remain intact.
+
+All rules retain nonempty immutable `UserId` in their output and map it to the
+Account `AadUserId`; alerts use `AlertPerResult` to avoid combining unrelated
+users into one alert. Rules 2 and 5 also map their scalar result IP. Aggregate IP
+arrays remain investigation context. The stable API carries parent MITRE
+techniques; sub-technique detail remains in this documentation instead of an
+unsupported `subTechniques` property. See [entity identifiers](https://learn.microsoft.com/azure/sentinel/entities-reference)
+and the [scheduled-rule API](https://learn.microsoft.com/rest/api/securityinsights/alert-rules/create-or-update?view=rest-securityinsights-2024-03-01).
+
+The travel rule preserves subsecond elapsed time and separately labels distant
+events with equal timestamps as `Simultaneous`; speed is null for those rows.
+GeoIP and timestamp quality still need analyst review. The off-hours hunt ends
+at 06:00 UTC exclusively, matching its documented 22:00–06:00 window.
 
 `Test-SessionHijack.ps1` is a benign connectivity and seed-activity helper. It
 does not hijack a session, replay a stolen token, force token refreshes, control
