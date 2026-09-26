@@ -572,16 +572,7 @@ foreach ($state in $ruleStates) {
             incidentConfiguration = @{
                 createIncident        = $true
                 groupingConfiguration = @{
-                    eventGroupingSettings = @{ aggregationKind = 'AlertPerResult' }
-            entityMappings        = @(@{
-                entityType = 'Account'
-                fieldMappings = @(@{ identifier = 'AadUserId'; columnName = 'UserId' })
-            }) + $(if ($rule.displayName -eq $LabRuleNames[1]) {
-                @(@{ entityType = 'IP'; fieldMappings = @(@{ identifier = 'Address'; columnName = 'IPAddress' }) })
-            } elseif ($rule.displayName -eq $LabRuleNames[4]) {
-                @(@{ entityType = 'IP'; fieldMappings = @(@{ identifier = 'Address'; columnName = 'AuthIP' }) })
-            } else { @() })
-            enabled               = $true
+                    enabled               = $true
                     reopenClosedIncident  = $false
                     lookbackDuration      = "PT5H"
                     matchingMethod        = "AllEntities"

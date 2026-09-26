@@ -103,6 +103,8 @@ class ReviewRepairTests(unittest.TestCase):
             self.assertEqual(rule['eventGroupingSettings']['aggregationKind'],'AlertPerResult')
             self.assertEqual(rule['entityMappings'][0]['fieldMappings'],[{'identifier':'AadUserId','columnName':'UserId'}])
             self.assertNotIn('subTechniques',rule)
+            self.assertEqual(set(rule['incidentConfiguration']['groupingConfiguration']),
+                {'enabled','reopenClosedIncident','lookbackDuration','matchingMethod'})
             self.assertIn('UserId',rule['query'].split('| project')[-1])
         self.assertEqual(rules[0]['queryPeriod'],'P14D')
         self.assertEqual(rules[2]['queryPeriod'],'P7D')
