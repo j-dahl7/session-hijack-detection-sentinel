@@ -13,6 +13,14 @@ incidents may demonstrate earlier revisions, but they do not prove that the
 current helper will create the token issuance, refresh, device, geography, risk,
 or revoked-grant rows required by every rule.
 
+The November 13, 2026 revision changes the deployment default: all five rules
+are now created disabled, and `-EnableRules` is the explicit switch that enables
+them. Validation of that revision is offline checks only, run on November 13,
+2026: PowerShell parsing and the mocked deployment and cleanup tests, including
+a contract test that fails if a default deployment ever sends an enabled rule.
+The five rule queries are unchanged. The disabled default and `-EnableRules`
+have not been deployed to, or exercised against, a live Sentinel workspace.
+
 ## What Gets Deployed
 
 | Resource | Type | MITRE |
@@ -23,6 +31,38 @@ or revoked-grant rows required by every rule.
 | LAB - Browser or OS Mismatch in Same Session | Analytics Rule (Medium) | T1539, T1550.001 |
 | LAB - Revoked Grant Followed by New-IP Authentication | Analytics Rule (High) | Entra error 50173 followed by a same-UserId success from a different IP; triage lead, not proof of theft or CAE enforcement. T1539, T1550.001 |
 | Session Hijack Threat Dashboard | Workbook | - |
+
+All five rules are created disabled; the next section explains how to enable
+them.
+
+## Rule State: Disabled by Default
+
+Rules deploy disabled unless `-EnableRules` is explicitly supplied. Microsoft
+documents that a rule created with the Disabled status is created but does not
+run, and that an Enabled rule runs immediately upon creation
+([Create scheduled analytics rules](https://learn.microsoft.com/azure/sentinel/create-analytics-rules)).
+A disabled rule therefore creates no alerts or incidents. Each rule keeps its
+incident-creation setting, which applies as soon as the rule is enabled.
+
+1. Deploy without the switch and review the five rules in Microsoft Sentinel >
+   Analytics > Active rules.
+2. Run each query manually against your own sign-in data and tune thresholds
+   and exclusions (see [Validation Expectations](#validation-expectations)).
+3. Enable deliberately: rerun the same command with `-EnableRules`, or enable
+   individual rules from the Active rules list.
+
+The switch is declarative: every deployment writes the state it was asked for.
+A later run without `-EnableRules` returns all five lab rules to disabled,
+including rules you enabled in the portal, and warns about each enabled rule
+before it does. `-WhatIf` prints the same warnings and the planned state
+without writing. After each write the deployer compares the state in Sentinel's
+response with the requested one and stops if they differ. The summary reports
+that confirmed state and the command that enables the rules later.
+`-EnableRules` cannot be combined with `-Destroy` or `-SkipSentinel`.
+
+Revisions through commit `6992806` created every rule enabled. Rules deployed
+from those revisions stay enabled until you rerun this revision without
+`-EnableRules`, disable them in the portal, or remove them with `-Destroy`.
 
 ## Prerequisites
 
@@ -53,18 +93,23 @@ Existing ingestion, retention, Entra licensing, and Sentinel charges apply.
 git clone https://github.com/j-dahl7/session-hijack-detection-sentinel.git
 cd session-hijack-detection-sentinel
 
+# Creates the workbook and the five rules, disabled (safe default)
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab"
+
+# After reviewing and tuning the queries, enable the rules explicitly
+./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -EnableRules
 ./scripts/Test-SessionHijack.ps1 -TenantId "<tenant-id>" -BurstCount 30
 
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -Destroy -WhatIf
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -Destroy
 ```
 
-For deployment preview, append `-WhatIf` to the first deploy command. It still
+For deployment preview, append `-WhatIf` to either deploy command. It still
 performs read-only discovery, diagnostic-setting checks, and workspace queries,
-but guarded rule/workbook writes are skipped. `-Destroy -WhatIf` lists and
-validates deterministic IDs and ownership markers without deleting them.
-Neither preview validates live rule output.
+but guarded rule/workbook writes are skipped, and the summary shows the planned
+rule state. `-Destroy -WhatIf` lists and validates deterministic IDs and
+ownership markers without deleting them. Neither preview validates live rule
+output.
 
 Cleanup also recognizes the deterministic ID and ownership marker of the prior
 `LAB - CAE Revocation Followed by New Location Auth` rule. An upgrade stops if
@@ -73,9 +118,11 @@ Resources with a matching title but an unknown ID or missing marker are never
 adopted or deleted automatically; inspect those older deployments manually.
 
 Deployment parameters are `-ResourceGroup`, `-WorkspaceName`,
-`-SkipDiagnostics`, `-SkipSentinel`, `-Destroy`, and PowerShell's common
-`-WhatIf` switch. The helper accepts `-TenantId`, `-BurstCount` (default 30),
-and `-SkipBurst`.
+`-SkipDiagnostics`, `-SkipSentinel`, `-EnableRules` (alias
+`-EnableSentinelRules`), `-Destroy`, and PowerShell's common `-WhatIf` switch.
+`Get-Help ./scripts/Deploy-Lab.ps1 -Parameter EnableRules` shows the switch and
+its disabled default. The helper accepts `-TenantId`, `-BurstCount` (default
+30), and `-SkipBurst`.
 
 ## Validation Expectations
 
@@ -124,9 +171,10 @@ rule.
 | Revoked Grant | Error 50173 in either interactive or non-interactive logs, followed within 30 minutes by a successful authentication in either table for the same nonempty immutable `UserId` from a different `IPAddress`; the helper does not perform this lifecycle |
 
 Validate in layers: confirm raw rows and their session/correlation fields,
-execute each KQL query manually over the right time window, then wait for the
-scheduled rule and incident pipeline. Treat rule silence as a data/condition
-question, not proof that the deployment or attack simulation succeeded.
+execute each KQL query manually over the right time window, then enable the
+rules with `-EnableRules` and wait for the scheduled rule and incident pipeline.
+Treat rule silence as a rule-state or data/condition question, not proof that
+the deployment or attack simulation succeeded.
 
 ### Rule 5 manual validation
 
@@ -143,7 +191,7 @@ invalidates that user's refresh tokens across applications:
    IP B within 30 minutes. Confirm a success (`ResultType == "0"`) with the same
    `UserId` and a different `IPAddress`.
 5. Run Rule 5 manually over the matching time range before waiting for its
-   hourly schedule.
+   hourly schedule, which runs only while the rule is enabled.
 
 Microsoft documents 50173 as an expired grant that was revoked; causes include
 password changes, refresh-token expiry, and administrator revocation. It does
@@ -160,10 +208,13 @@ identity and review that external call for your environment.
 
 ## Troubleshooting
 
+- **No alerts or incidents:** rules are disabled by default, and a disabled rule
+  never runs. Check each rule's status in Microsoft Sentinel > Analytics, verify
+  the raw sign-in rows and the manual query, then enable with `-EnableRules`.
 - **WSL and VPN:** WSL terminals may bypass your Windows VPN. Run az rest from Windows PowerShell or Azure Cloud Shell where the VPN is active.
 - **Sign-in log ingestion delay:** `AADNonInteractiveUserSignInLogs` can be
   delayed or aggregated; do not assume a fixed arrival window.
-- **Rule evaluation frequency:** the bundled analytics rules are configured
+- **Rule evaluation frequency:** once enabled, the bundled analytics rules run
   hourly (`PT1H`). Ingestion, scheduling, and incident creation can add further
   delay.
 - **Risk Level Distribution panel empty:** Expected in low-risk sandboxes until Identity Protection emits medium or high risk signals.
@@ -173,9 +224,10 @@ identity and review that external call for your environment.
 ## Cleanup Scope
 
 Destroy mode removes only the five deterministically identified, ownership-
-marked analytics rules and the ownership-tagged workbook from the named
-existing workspace. It does not delete the resource group, workspace,
-diagnostic settings, sign-in data, incidents, or shared licensing/configuration.
+marked analytics rules, enabled or disabled, and the ownership-tagged workbook
+from the named existing workspace. It does not delete the resource group,
+workspace, diagnostic settings, sign-in data, incidents, or shared
+licensing/configuration.
 Always run `-Destroy -WhatIf` first and verify the subscription, resource group,
 workspace, IDs, and ownership markers shown.
 

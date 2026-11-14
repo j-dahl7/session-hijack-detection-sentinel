@@ -100,6 +100,7 @@ class ReviewRepairTests(unittest.TestCase):
         rules=[body['properties'] for body in result['bodies'] if body['kind']=='Scheduled']
         self.assertEqual(len(rules),5)
         for rule in rules:
+            self.assertIs(rule['enabled'],False,'rules deploy disabled unless -EnableRules is supplied')
             self.assertEqual(rule['eventGroupingSettings']['aggregationKind'],'AlertPerResult')
             self.assertEqual(rule['entityMappings'][0]['fieldMappings'],[{'identifier':'AadUserId','columnName':'UserId'}])
             self.assertNotIn('subTechniques',rule)
