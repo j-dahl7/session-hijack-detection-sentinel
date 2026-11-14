@@ -1,4 +1,5 @@
 #Requires -Version 7.0
+
 <#
 .SYNOPSIS
     Simulates infostealer session hijacking telemetry for detection rule validation.
@@ -186,8 +187,10 @@ Write-Host ""
 Write-Host "Validation timing:" -ForegroundColor Yellow
 Write-Host "  Sign-in ingestion, hourly rule evaluation, and incident creation are"
 Write-Host "  asynchronous. Confirm raw rows first; do not assume a fixed arrival time."
+Write-Host "  Deploy-Lab.ps1 creates the rules disabled, and a disabled rule never runs."
+Write-Host "  Enable them with Deploy-Lab.ps1 -EnableRules before expecting alerts."
 Write-Host ""
-Write-Host "Detection expectations (dependent on actual sign-in telemetry):" -ForegroundColor Yellow
+Write-Host "Detection expectations (dependent on enabled rules and actual sign-in telemetry):" -ForegroundColor Yellow
 Write-Host "  Rule 1 (Token Replay):     If current IP is new for your account"
 Write-Host "  Rule 3 (Surge):            Requires real token-refresh volume above baseline"
 Write-Host "  Rule 4 (Fingerprint):      Requires real DeviceDetail fingerprint diversity"

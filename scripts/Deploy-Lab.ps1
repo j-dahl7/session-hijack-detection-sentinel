@@ -1,4 +1,5 @@
 #Requires -Version 7.4
+
 <#
 .SYNOPSIS
     Deploys the Infostealer Session Hijacking Detection Lab.
@@ -6,7 +7,8 @@
 .DESCRIPTION
     Deploys detection resources to an existing Microsoft Sentinel workspace:
     1. Verifies Entra ID diagnostic settings (SigninLogs, NonInteractiveUserSignInLogs)
-    2. Sentinel analytics rules (5 scheduled rules for session hijacking detection)
+    2. Sentinel analytics rules (5 scheduled rules for session hijacking detection),
+       created disabled unless -EnableRules is supplied
     3. Sentinel workbook (Session Hijack Threat Dashboard)
     4. Points to the optional session-hijacking telemetry helper
 
@@ -22,11 +24,23 @@
 .PARAMETER SkipSentinel
     Skip deploying analytics rules and workbook.
 
+.PARAMETER EnableRules
+    Create or update the five analytics rules enabled. Without this switch the
+    rules are created or updated disabled, so they do not run, raise alerts, or
+    create incidents until an operator has reviewed the queries. A later run
+    without this switch sets the lab's rules back to disabled. Not valid with
+    -Destroy or -SkipSentinel. Alias: -EnableSentinelRules.
+
 .PARAMETER Destroy
     Tear down all lab resources (analytics rules and workbook).
 
 .EXAMPLE
     ./Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab"
+    Deploy the five detection rules disabled, plus the workbook, to an existing Sentinel workspace.
+
+.EXAMPLE
+    ./Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -EnableRules
+    After reviewing the queries, redeploy with the five analytics rules enabled.
 
 .EXAMPLE
     ./Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -Destroy
@@ -47,6 +61,10 @@ param(
     [switch]$SkipSentinel,
 
     [Parameter()]
+    [Alias('EnableSentinelRules')]
+    [switch]$EnableRules,
+
+    [Parameter()]
     [switch]$Destroy
 )
 
@@ -65,6 +83,14 @@ $LabRuleNames = @(
 )
 $LegacyRuleNames = @('LAB - CAE Revocation Followed by New Location Auth')
 $LabWorkbookTitle = 'Session Hijack Threat Dashboard'
+
+if ($EnableRules -and ($Destroy -or $SkipSentinel)) {
+    throw '-EnableRules applies only to a deployment that writes the analytics rules and cannot be combined with -Destroy or -SkipSentinel.'
+}
+# Safe default: the analytics rules are created or updated disabled. They run,
+# raise alerts, and create incidents only after an explicit -EnableRules.
+$RulesEnabled = [bool]$EnableRules
+$ruleStateWord = if ($RulesEnabled) { 'enabled' } else { 'disabled' }
 
 function Get-LabResourceGuid {
     param([Parameter(Mandatory)][string]$ResourceKey)
@@ -138,6 +164,9 @@ function Get-AllLabAlertRules {
 Write-Host "`n=== Infostealer Session Hijacking Detection Lab ===" -ForegroundColor Cyan
 Write-Host "Resource Group: $ResourceGroup"
 Write-Host "Workspace:      $WorkspaceName"
+if (-not $Destroy -and -not $SkipSentinel) {
+    Write-Host "Rule state:     $(if ($RulesEnabled) { 'ENABLED by -EnableRules' } else { 'DISABLED (safe default; add -EnableRules to enable)' })"
+}
 Write-Host ""
 
 # --- [0/7] Pre-flight ---
@@ -543,6 +572,9 @@ foreach ($state in $ruleStates) {
     $ruleId = $state.ResourceId
     $existingById = $state.Existing
     Write-Host "  Deploying: $($rule.displayName)"
+    if (-not $RulesEnabled -and $existingById -and $existingById.properties.enabled -eq $true) {
+        Write-Host "    Currently enabled; deploying without -EnableRules sets it to disabled." -ForegroundColor Yellow
+    }
 
     $ruleBody = @{
         kind       = "Scheduled"
@@ -568,7 +600,7 @@ foreach ($state in $ruleStates) {
             } elseif ($rule.displayName -eq $LabRuleNames[4]) {
                 @(@{ entityType = 'IP'; fieldMappings = @(@{ identifier = 'Address'; columnName = 'AuthIP' }) })
             } else { @() })
-            enabled               = $true
+            enabled               = $RulesEnabled
             incidentConfiguration = @{
                 createIncident        = $true
                 groupingConfiguration = @{
@@ -582,7 +614,7 @@ foreach ($state in $ruleStates) {
     } | ConvertTo-Json -Depth 10
 
     $ruleAction = if ($existingById) { "Updated" } else { "Created" }
-    if ($PSCmdlet.ShouldProcess($rule.displayName, "$ruleAction Sentinel analytics rule")) {
+    if ($PSCmdlet.ShouldProcess($rule.displayName, "$ruleAction Sentinel analytics rule ($ruleStateWord)")) {
         $bodyFile = New-TemporaryFile
         try {
             [System.IO.File]::WriteAllText($bodyFile.FullName, $ruleBody, [System.Text.Encoding]::UTF8)
@@ -594,7 +626,11 @@ foreach ($state in $ruleStates) {
             if (-not $result.name) {
                 throw "Sentinel did not return an analytics rule resource"
             }
-            Write-Host "    ${ruleAction}: $($result.name)" -ForegroundColor Green
+            # The summary reports the rule state, so require the service to echo it.
+            if ($result.properties.enabled -isnot [bool] -or $result.properties.enabled -ne $RulesEnabled) {
+                throw "Sentinel did not confirm analytics rule '$($rule.displayName)' as $ruleStateWord. Inspect the rule in the workspace before relying on its state."
+            }
+            Write-Host "    ${ruleAction}: $($result.name) ($ruleStateWord)" -ForegroundColor Green
         }
         finally {
             Remove-Item $bodyFile.FullName -Force -ErrorAction SilentlyContinue
@@ -644,12 +680,33 @@ Write-Host "    - LAB - Impossible Travel on Token Refresh (High)"
 Write-Host "    - LAB - Anomalous Non-Interactive Sign-in Surge (Medium)"
 Write-Host "    - LAB - Browser or OS Mismatch in Same Session (Medium)"
 Write-Host "    - LAB - Revoked Grant Followed by New-IP Authentication (High)"
+if ($RulesEnabled) {
+    Write-Host "  Rule state:      ENABLED by -EnableRules (hourly runs; each result requests an alert, with incident creation on)"
+} else {
+    Write-Host "  Rule state:      DISABLED (safe default; disabled rules do not run, raise alerts, or create incidents)"
+}
 Write-Host "  Workbook:        Session Hijack Threat Dashboard"
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Yellow
-Write-Host "  1. Open Microsoft Sentinel > Analytics to review the 5 new rules"
-Write-Host "  2. Open Workbooks > 'Session Hijack Threat Dashboard'"
-Write-Host "  3. Run hunting queries in detection/hunting-queries.kql"
-Write-Host "  4. Run Test-SessionHijack.ps1 to generate test telemetry"
-Write-Host "  5. Wait ~1 hour for analytics rules to evaluate"
+Write-Host "  1. Open Microsoft Sentinel > Configuration > Analytics to review the 5 LAB rules"
+if ($RulesEnabled) {
+    Write-Host "  2. -EnableRules deploys the rules enabled. To disable them, rerun without"
+    Write-Host "     -EnableRules or disable each rule on the Active rules tab."
+} else {
+    Write-Host "  2. The rules deploy disabled. After reviewing the queries, enable them with:"
+    Write-Host "       ./scripts/Deploy-Lab.ps1 -ResourceGroup '$ResourceGroup' -WorkspaceName '$WorkspaceName' -EnableRules"
+    Write-Host "     A rerun rewrites each rule from this repository; if you edited a rule in the"
+    Write-Host "     portal, enable it on the Active rules tab instead. A later run without"
+    Write-Host "     -EnableRules disables the rules again. Enable them before generating test"
+    Write-Host "     activity: each rule alerts only on evidence ingested in the hour before a run."
+}
+Write-Host "  3. Open Workbooks > 'Session Hijack Threat Dashboard'"
+Write-Host "  4. Run hunting queries in detection/hunting-queries.kql"
+if ($RulesEnabled) {
+    Write-Host "  5. Run Test-SessionHijack.ps1 to generate test telemetry"
+    Write-Host "  6. Wait ~1 hour for analytics rules to evaluate"
+} else {
+    Write-Host "  5. After enabling the rules, run Test-SessionHijack.ps1 to generate test telemetry"
+    Write-Host "  6. Wait ~1 hour for the enabled rules to evaluate"
+}
 Write-Host ""
