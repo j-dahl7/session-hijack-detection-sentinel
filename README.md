@@ -54,8 +54,12 @@ incident-creation setting, which applies as soon as the rule is enabled.
 
 1. Deploy without the switch and review the five rules in Microsoft Sentinel >
    Analytics > Active rules.
-2. Run each query manually against your own sign-in data and tune thresholds
-   and exclusions (see [Validation Expectations](#validation-expectations)).
+2. Run each query manually against your own sign-in data (see
+   [Validation Expectations](#validation-expectations)). To tune thresholds
+   and exclusions, edit the queries in `scripts/Deploy-Lab.ps1`, which deploys
+   them. It does not read `detection/analytics-rules.kql`, but the offline
+   tests require that copy to match, so change it too. The next deployment
+   without `-SkipSentinel` replaces a query changed in the portal.
 3. Enable deliberately: rerun the same command with `-EnableRules`, or enable
    individual rules from the Active rules list.
 
@@ -109,12 +113,21 @@ Deploy to your existing Sentinel workspace:
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab"
 ```
 
-Review and tune the queries, then enable the rules:
+The next run writes each rule again from `scripts/Deploy-Lab.ps1`, so it
+replaces any query you changed in the portal. Review the queries, tune them
+in that file if needed, then enable the rules:
 
 ```powershell
-# After reviewing and tuning the queries, enable the rules explicitly
+# After reviewing the queries, enable the rules explicitly
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -EnableRules
 ```
+
+Every later deployment without `-SkipSentinel` writes the five rules again
+from the script, with their stored queries. It also writes the workbook again
+from `workbook/session-hijack-workbook.json`. If you enabled the rules, add
+`-EnableRules` to each rerun, or they return to disabled. Add `-SkipSentinel`
+instead to leave the rules and the workbook as they are, including changes
+made in the portal. That run stops after its read-only checks.
 
 With the rules enabled, generate seed activity:
 
