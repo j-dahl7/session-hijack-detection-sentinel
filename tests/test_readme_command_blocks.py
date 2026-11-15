@@ -7,6 +7,14 @@ right-click paste runs each line as its newline arrives
 its real command therefore runs the real command before anyone has read the
 preview, and a block that deploys the rules disabled and then reruns the
 deployer with -EnableRules enables them before anyone has reviewed the queries.
+
+The words around those blocks must match what the deployer does. Every
+deployment without -SkipSentinel writes each rule again from the query stored
+in scripts/Deploy-Lab.ps1, enabled only when -EnableRules is given. A query
+tuned in the portal before the -EnableRules run is lost, and a later run
+without the switch disables the rules again. So advice to tune names that
+file, and the -EnableRules step says what a later run does.
+
 These tests read README.md only; nothing runs.
 """
 
@@ -22,6 +30,8 @@ README = ROOT / "README.md"
 # has no backtick). It closes on a line of the same character, at least as long,
 # with nothing after it; an unclosed block runs to the end of the file.
 FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+# A list item starts with a number and a dot or parenthesis, or a bullet.
+LIST_ITEM = re.compile(r"^\s*(?:\d+[.)]|[-*+])\s")
 # Words, with quoted text kept whole, and the separators that end a command.
 TOKEN = re.compile(r"""(?:"[^"]*"|'[^']*'|[^\s"';&|]|&(?!&)|\|(?!\|))+|;|&&|\|\|""")
 SEPARATORS = {";", "&&", "||"}
@@ -30,6 +40,16 @@ ENABLE_SWITCHES = {"-enablerules", "-enablesentinelrules"}
 # The scripts whose runs reach Azure, Entra or Microsoft Graph. Each run, a
 # -WhatIf preview included, is one step and needs a block of its own.
 STEP_SCRIPTS = {"deploy-lab.ps1", "test-sessionhijack.ps1"}
+# The deployer writes each rule from the query stored in this file, so advice
+# to tune a query must say to tune it there.
+QUERY_SOURCE = "scripts/Deploy-Lab.ps1"
+TUNING = re.compile(r"\btun(?:e|es|ed|ing)\b", re.IGNORECASE)
+# What the prose right after the -EnableRules block must say about later runs.
+RERUN_FACTS = (
+    "Every later deployment without `-SkipSentinel` writes the five rules again",
+    "add `-EnableRules` to each rerun, or they return to disabled",
+    "`-SkipSentinel` instead to leave the rules and the workbook as they are",
+)
 
 # The Quick Start block as README.md carried it at commit 1f4c3e7. One paste
 # deployed the rules, enabled them, ran the helper, previewed the cleanup and
@@ -47,6 +67,20 @@ cd session-hijack-detection-sentinel
 
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -Destroy -WhatIf
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -Destroy
+"""
+
+# The enabling step as README.md carried it at commit 31b24f4. It asked for
+# tuning before the run that writes every rule again from the script, and
+# nothing after it said what a later run does.
+TUNE_THEN_ENABLE = """\
+Review and tune the queries, then enable the rules:
+
+```powershell
+# After reviewing and tuning the queries, enable the rules explicitly
+./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -EnableRules
+```
+
+With the rules enabled, generate seed activity:
 """
 
 
@@ -144,10 +178,64 @@ def block_problems(found):
     return problems
 
 
+def guidance(markdown):
+    """Return (line number, text) for each paragraph, list item and code comment.
+
+    Table rows are left out: the What Gets Deployed table describes the rules
+    and gives no steps.
+    """
+    found, fenced = [], set()
+    for start, body in fenced_blocks(markdown):
+        fenced.update(range(start, start + len(body) + 2))  # both fences and the body
+        for number, line in enumerate(body, start + 1):
+            comment = line[len(drop_comment(line)):]
+            if comment:
+                found.append((number, " ".join(comment.lstrip("#").split())))
+    paragraph, first = [], 0
+    for number, line in enumerate(markdown.splitlines() + [""], 1):
+        ends = number in fenced or not line.strip() or line.lstrip().startswith("|")
+        if paragraph and (ends or LIST_ITEM.match(line)):
+            found.append((first, " ".join(" ".join(paragraph).split())))
+            paragraph = []
+        if not ends:
+            if not paragraph:
+                first = number
+            paragraph.append(line)
+    return sorted(found)
+
+
+def tuning_problems(markdown):
+    """Return each paragraph or comment that mentions tuning but not the file that holds the queries."""
+    return [f"line {number}: {text}" for number, text in guidance(markdown)
+            if TUNING.search(text) and QUERY_SOURCE not in text]
+
+
+def after_enabling_step(markdown):
+    """Return the prose from the Deploy-Lab.ps1 -EnableRules block to the next block or heading."""
+    lines = markdown.splitlines()
+    for start, body in fenced_blocks(markdown):
+        if any(command.name == "deploy-lab.ps1" and command.enables and not command.preview
+               for command in commands(body)):
+            prose = []
+            for line in lines[start + len(body) + 1:]:  # the lines after the closing fence
+                if FENCE.match(line) or line.startswith("#"):
+                    break
+                prose.append(line)
+            return " ".join(" ".join(prose).split())
+    return ""
+
+
+def rerun_problems(markdown):
+    """Return each fact about later runs that the prose after the -EnableRules block leaves out."""
+    prose = after_enabling_step(markdown)
+    return [fact for fact in RERUN_FACTS if fact not in prose]
+
+
 class ReadmeCommandBlockTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.blocks = fenced_blocks(README.read_text(encoding="utf-8"))
+        cls.markdown = README.read_text(encoding="utf-8")
+        cls.blocks = fenced_blocks(cls.markdown)
 
     def test_each_readme_block_holds_at_most_one_lab_step(self):
         self.assertTrue(self.blocks, "README.md has no fenced code block")
@@ -202,6 +290,38 @@ class ReadmeCommandBlockTests(unittest.TestCase):
         self.assertFalse(commands(["./scripts/Deploy-Lab.ps1 -WhatIf:$false"])[0].preview)
         self.assertTrue(commands(["./scripts/Deploy-Lab.ps1 -EnableSentinelRules"])[0].enables)
         self.assertEqual(block_problems(commands([COMBINED_QUICK_START.splitlines()[-1]])), [])
+
+    def test_tuning_advice_names_the_file_that_holds_the_queries(self):
+        # A query tuned only in the portal is lost on the next deployment
+        # without -SkipSentinel, the -EnableRules run included.
+        self.assertEqual(tuning_problems(self.markdown), [])
+
+    def test_the_enabling_step_says_what_a_later_run_does(self):
+        self.assertEqual(rerun_problems(self.markdown), [])
+
+    def test_the_checks_flag_the_enabling_step_that_asked_for_tuning_first(self):
+        # Keeps the checks honest: they must reject the enabling step that
+        # README.md carried at 31b24f4, for its lead-in, for its comment and
+        # for the missing rerun warning.
+        self.assertEqual(tuning_problems(TUNE_THEN_ENABLE), [
+            "line 1: Review and tune the queries, then enable the rules:",
+            "line 4: After reviewing and tuning the queries, enable the rules explicitly",
+        ])
+        self.assertEqual(rerun_problems(TUNE_THEN_ENABLE), list(RERUN_FACTS))
+        # A table row describes a rule; each list item, and each comment apart
+        # from its command, must name the file itself.
+        sample = "\n".join([
+            "| Rule | needs tenant tuning |",
+            "",
+            "1. Deploy with `scripts/Deploy-Lab.ps1`.",
+            "2. Tune the thresholds.",
+            "",
+            "```powershell",
+            "./scripts/Deploy-Lab.ps1 # tune first",
+            "```",
+        ])
+        self.assertEqual(tuning_problems(sample),
+                         ["line 4: 2. Tune the thresholds.", "line 7: tune first"])
 
 
 if __name__ == "__main__":
