@@ -21,6 +21,14 @@ a contract test that fails if a default deployment ever sends an enabled rule.
 The five rule queries are unchanged. The disabled default and `-EnableRules`
 have not been deployed to, or exercised against, a live Sentinel workspace.
 
+The November 14, 2026 revision changes only how the README presents the Quick
+Start: each step now has its own code block, so a pasted block runs only that
+step. The commands are unchanged. The new `tests/test_readme_command_blocks.py`
+fails if a README code block holds more than one lab step, such as a `-WhatIf`
+preview and its real command, or a deployment and the `-EnableRules` rerun.
+Validation of that revision is offline checks only, run on November 14, 2026:
+PowerShell parsing and the offline test suite. Nothing was deployed.
+
 ## What Gets Deployed
 
 | Resource | Type | MITRE |
@@ -92,15 +100,37 @@ Existing ingestion, retention, Entra licensing, and Sentinel charges apply.
 ```powershell
 git clone https://github.com/j-dahl7/session-hijack-detection-sentinel.git
 cd session-hijack-detection-sentinel
+```
 
+Deploy to your existing Sentinel workspace:
+
+```powershell
 # Creates the workbook and the five rules, disabled (safe default)
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab"
+```
 
+Review and tune the queries, then enable the rules:
+
+```powershell
 # After reviewing and tuning the queries, enable the rules explicitly
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -EnableRules
-./scripts/Test-SessionHijack.ps1 -TenantId "<tenant-id>" -BurstCount 30
+```
 
+With the rules enabled, generate seed activity:
+
+```powershell
+./scripts/Test-SessionHijack.ps1 -TenantId "<tenant-id>" -BurstCount 30
+```
+
+Preview the cleanup:
+
+```powershell
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -Destroy -WhatIf
+```
+
+Read the preview output, then run the cleanup:
+
+```powershell
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -Destroy
 ```
 
